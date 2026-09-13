@@ -51,46 +51,6 @@ pub fn determine_amp_message_status(last_msg: &Value) -> AgentStatus {
     }
 }
 
-pub fn determine_claude_code_status(entry: &Value) -> Option<AgentStatus> {
-    let message = entry.get("message")?;
-    let role = message.get("role").and_then(Value::as_str)?;
-    let content = message.get("content");
-
-    match role {
-        "assistant" => {
-            if content_has_type(content, "tool_use") || content_has_type(content, "thinking") {
-                return Some(AgentStatus::Running);
-            }
-            match message.get("stop_reason").and_then(Value::as_str) {
-                None => Some(AgentStatus::Running),
-                Some("end_turn") => Some(AgentStatus::Done),
-                Some("tool_use") => Some(AgentStatus::Running),
-                Some(_) => Some(AgentStatus::Done),
-            }
-        }
-        "user" => {
-            if let Some(text) = content_text(content) {
-                if text.starts_with("[Request interrupted by user")
-                    || text.starts_with("[Request interrupted")
-                {
-                    return Some(AgentStatus::Interrupted);
-                }
-                if text.contains("<command-name>/exit</command-name>") {
-                    return Some(AgentStatus::Done);
-                }
-                if text.contains("<command-name>/") || is_noise_user_prefix(&text) {
-                    return None;
-                }
-            }
-            if content_has_type(content, "tool_result") {
-                return Some(AgentStatus::Running);
-            }
-            Some(AgentStatus::Running)
-        }
-        _ => None,
-    }
-}
-
 pub fn determine_codex_status(entry: &Value) -> Option<AgentStatus> {
     match entry.get("type").and_then(Value::as_str) {
         Some("event_msg") => match entry.pointer("/payload/type").and_then(Value::as_str) {
@@ -190,14 +150,6 @@ pub fn determine_pi_status(entry: &Value) -> AgentStatus {
     }
 }
 
-fn content_has_type(content: Option<&Value>, target_type: &str) -> bool {
-    content.and_then(Value::as_array).is_some_and(|items| {
-        items
-            .iter()
-            .any(|item| item.get("type").and_then(Value::as_str) == Some(target_type))
-    })
-}
-
 fn content_has_type_with_run_status(
     content: Option<&Value>,
     target_type: &str,
@@ -209,34 +161,4 @@ fn content_has_type_with_run_status(
                 && item.pointer("/run/status").and_then(Value::as_str) == Some(run_status)
         })
     })
-}
-
-fn content_text(content: Option<&Value>) -> Option<String> {
-    match content? {
-        Value::String(text) => Some(text.clone()),
-        Value::Array(items) => items
-            .iter()
-            .find(|item| {
-                item.get("type").and_then(Value::as_str) == Some("text")
-                    && item.get("text").is_some()
-            })
-            .and_then(|item| item.get("text").and_then(Value::as_str))
-            .map(str::to_string),
-        _ => None,
-    }
-}
-
-fn is_noise_user_prefix(text: &str) -> bool {
-    [
-        "<local-command-caveat>",
-        "<local-command-stdout>",
-        "<local-command-stderr>",
-        "<bash-input>",
-        "<bash-stdout>",
-        "<bash-stderr>",
-        "<system-reminder>",
-        "<task-notification>",
-    ]
-    .iter()
-    .any(|prefix| text.starts_with(prefix))
 }

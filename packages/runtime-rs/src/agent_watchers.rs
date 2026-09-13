@@ -4,11 +4,12 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use crate::agent_parsers::{
-    determine_amp_message_status, determine_claude_code_status, determine_codex_status,
-    determine_opencode_status,
+    determine_amp_message_status, determine_codex_status, determine_opencode_status,
 };
 use crate::claude_registry::claude_code_config_dirs_from;
 use crate::protocol::AgentStatus;
+use crate::tracker::{LastEntry, TranscriptHint};
+use crate::transcript_tail::TailState;
 
 const THREAD_NAME_MAX: usize = 80;
 const TOOL_USE_WAIT_MS: u64 = 3_000;
@@ -56,6 +57,8 @@ pub fn amp_snapshot_from_thread_json(raw: &str, ts: u64) -> Option<AgentWatcherS
     })
 }
 
+/// Whole-file convenience over `ClaudeTranscriptState`; the server keeps
+/// per-file states in a `TailCache` and only feeds appended lines.
 pub fn claude_code_snapshot_from_jsonl(
     thread_id: &str,
     project_dir: &str,
@@ -63,58 +66,209 @@ pub fn claude_code_snapshot_from_jsonl(
     mtime_ms: u64,
     now_ms: u64,
 ) -> Option<AgentWatcherSnapshot> {
-    let mut status = AgentStatus::Idle;
-    let mut thread_name = None;
-    let mut last_user_prompt = None;
-    let mut last_entry_is_tool_use = false;
-    let mut saw_entry = false;
-
+    let mut state = ClaudeTranscriptState::default();
     for line in raw.lines().filter(|line| !line.trim().is_empty()) {
-        let Ok(entry) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        saw_entry = true;
-
-        if let Some(custom_title) = extract_claude_custom_title(&entry) {
-            thread_name = Some(custom_title);
-            continue;
-        }
-        if let Some(prompt) = extract_claude_user_prompt(&entry) {
-            if thread_name.is_none() {
-                thread_name = normalize_thread_name(&prompt);
-            }
-            last_user_prompt = Some(prompt);
-        }
-
-        if let Some(next_status) = determine_claude_code_status(&entry) {
-            status = next_status;
-        }
-        last_entry_is_tool_use = is_claude_tool_use_entry(&entry);
+        state.apply_line(line);
     }
-
-    if !saw_entry {
-        return None;
-    }
-
-    let idle_for = now_ms.saturating_sub(mtime_ms);
-    if status == AgentStatus::Running && last_entry_is_tool_use && idle_for >= TOOL_USE_WAIT_MS {
-        status = AgentStatus::Waiting;
-    }
-    if matches!(status, AgentStatus::Running | AgentStatus::Waiting) && idle_for >= STUCK_MS {
-        status = AgentStatus::Stale;
-    }
-
-    Some(AgentWatcherSnapshot {
-        agent: "claude-code",
-        thread_id: Some(thread_id.to_string()),
-        thread_name,
-        last_user_prompt,
-        project_dir: Some(project_dir.to_string()),
-        status,
-        ts: mtime_ms,
-    })
+    state.snapshot(thread_id, project_dir, mtime_ms, now_ms)
 }
 
+/// Incremental parse state of one Claude Code transcript.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClaudeTranscriptState {
+    pub session_id: Option<String>,
+    /// Working directory recorded on the entries themselves; more reliable
+    /// than decoding the project folder name.
+    pub cwd: Option<String>,
+    custom_title: Option<String>,
+    first_prompt_name: Option<String>,
+    /// Claude Code's own `last-prompt` record, when present.
+    last_prompt_record: Option<String>,
+    last_user_prompt: Option<String>,
+    status: Option<AgentStatus>,
+    last_entry: Option<LastEntry>,
+    saw_entry: bool,
+}
+
+impl TailState for ClaudeTranscriptState {
+    fn apply_line(&mut self, line: &str) {
+        let Ok(entry) = serde_json::from_str::<Value>(line) else {
+            return;
+        };
+        self.apply_entry(&entry);
+    }
+}
+
+impl ClaudeTranscriptState {
+    fn apply_entry(&mut self, entry: &Value) {
+        match entry.get("type").and_then(Value::as_str) {
+            Some("custom-title") => {
+                if let Some(title) = extract_claude_custom_title(entry) {
+                    self.custom_title = Some(title);
+                }
+                return;
+            }
+            Some("last-prompt") => {
+                if let Some(prompt) = entry
+                    .get("lastPrompt")
+                    .and_then(Value::as_str)
+                    .and_then(normalize_prompt)
+                {
+                    self.last_prompt_record = Some(prompt);
+                }
+                return;
+            }
+            _ => {}
+        }
+        let Some(role) = entry.pointer("/message/role").and_then(Value::as_str) else {
+            // Metadata records (mode, snapshots, system notes) say nothing
+            // about the conversation's state.
+            return;
+        };
+        self.saw_entry = true;
+        if self.session_id.is_none() {
+            self.session_id = entry
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(ToString::to_string);
+        }
+        if self.cwd.is_none() {
+            self.cwd = entry
+                .get("cwd")
+                .and_then(Value::as_str)
+                .filter(|cwd| !cwd.is_empty())
+                .map(ToString::to_string);
+        }
+        // Injected context (/context output, skill bodies, command output)
+        // and compaction summaries are not prompts and carry no status (F040).
+        if entry.get("isMeta") == Some(&Value::Bool(true))
+            || entry.get("isCompactSummary") == Some(&Value::Bool(true))
+        {
+            return;
+        }
+        let content = entry.pointer("/message/content");
+        match role {
+            "user" => {
+                let text = content_text(content);
+                if text
+                    .as_deref()
+                    .is_some_and(|text| text.starts_with("[Request interrupted"))
+                {
+                    self.last_entry = Some(LastEntry::Interrupted);
+                    self.status = Some(AgentStatus::Interrupted);
+                } else if content_has_type(content, "tool_result") {
+                    self.last_entry = Some(LastEntry::ToolResult);
+                    self.status = Some(AgentStatus::Running);
+                } else if let Some(text) = text {
+                    if text.contains("<command-name>/exit</command-name>") {
+                        self.status = Some(AgentStatus::Done);
+                    } else if text.contains("<command-name>/")
+                        || is_noise_user_text(&text)
+                        || text.starts_with("[Request")
+                    {
+                        // Slash commands and their output are not prompts.
+                    } else if let Some(prompt) = normalize_prompt(&text) {
+                        if self.first_prompt_name.is_none() {
+                            self.first_prompt_name = normalize_thread_name(&prompt);
+                        }
+                        self.last_user_prompt = Some(prompt);
+                        self.last_entry = Some(LastEntry::UserPrompt);
+                        self.status = Some(AgentStatus::Running);
+                    }
+                } else {
+                    self.last_entry = Some(LastEntry::UserPrompt);
+                    self.status = Some(AgentStatus::Running);
+                }
+            }
+            "assistant" => {
+                if entry.get("isApiErrorMessage") == Some(&Value::Bool(true)) {
+                    self.last_entry = Some(LastEntry::ApiError);
+                    self.status = Some(AgentStatus::Error);
+                } else if content_has_type(content, "tool_use") {
+                    self.last_entry = Some(LastEntry::AssistantToolUse);
+                    self.status = Some(AgentStatus::Running);
+                } else {
+                    match entry
+                        .pointer("/message/stop_reason")
+                        .and_then(Value::as_str)
+                    {
+                        None | Some("tool_use") => {
+                            self.last_entry = Some(LastEntry::Other);
+                            self.status = Some(AgentStatus::Running);
+                        }
+                        Some(_) => {
+                            self.last_entry = Some(LastEntry::AssistantEndTurn);
+                            self.status = Some(AgentStatus::Done);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn thread_name(&self) -> Option<String> {
+        self.custom_title
+            .clone()
+            .or_else(|| self.first_prompt_name.clone())
+    }
+
+    pub fn last_user_prompt(&self) -> Option<String> {
+        self.last_prompt_record
+            .clone()
+            .or_else(|| self.last_user_prompt.clone())
+    }
+
+    /// What a registry-sourced row can learn from this transcript.
+    pub fn hint(&self) -> TranscriptHint {
+        TranscriptHint {
+            thread_name: self.thread_name(),
+            last_user_prompt: self.last_user_prompt(),
+            last_entry: self.last_entry.unwrap_or(LastEntry::Other),
+        }
+    }
+
+    /// Fallback snapshot for sessions without a registry record: status is
+    /// inferred from the last entry plus silence timers.
+    pub fn snapshot(
+        &self,
+        thread_id: &str,
+        project_dir_fallback: &str,
+        mtime_ms: u64,
+        now_ms: u64,
+    ) -> Option<AgentWatcherSnapshot> {
+        if !self.saw_entry {
+            return None;
+        }
+        let mut status = self.status.unwrap_or(AgentStatus::Idle);
+        let idle_for = now_ms.saturating_sub(mtime_ms);
+        if status == AgentStatus::Running
+            && self.last_entry == Some(LastEntry::AssistantToolUse)
+            && idle_for >= TOOL_USE_WAIT_MS
+        {
+            status = AgentStatus::Waiting;
+        }
+        if matches!(status, AgentStatus::Running | AgentStatus::Waiting) && idle_for >= STUCK_MS {
+            status = AgentStatus::Stale;
+        }
+        Some(AgentWatcherSnapshot {
+            agent: "claude-code",
+            thread_id: Some(thread_id.to_string()),
+            thread_name: self.thread_name(),
+            last_user_prompt: self.last_user_prompt(),
+            project_dir: Some(
+                self.cwd
+                    .clone()
+                    .unwrap_or_else(|| project_dir_fallback.to_string()),
+            ),
+            status,
+            ts: mtime_ms,
+        })
+    }
+}
+
+/// Whole-file convenience over `CodexTranscriptState`.
 pub fn codex_snapshot_from_jsonl(
     thread_id: &str,
     raw: &str,
@@ -122,58 +276,97 @@ pub fn codex_snapshot_from_jsonl(
     mtime_ms: u64,
     now_ms: u64,
 ) -> Option<AgentWatcherSnapshot> {
-    let mut status = AgentStatus::Idle;
-    let mut project_dir = None;
-    let mut thread_name = indexed_thread_name.map(ToString::to_string);
-    let mut last_user_prompt = None;
-    let mut last_entry_is_tool_call = false;
-    let mut saw_entry = false;
-
+    let mut state = CodexTranscriptState::default();
     for line in raw.lines().filter(|line| !line.trim().is_empty()) {
-        let Ok(entry) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        saw_entry = true;
+        state.apply_line(line);
+    }
+    state.snapshot(thread_id, indexed_thread_name, mtime_ms, now_ms)
+}
 
-        if project_dir.is_none() {
-            project_dir = extract_codex_project_dir(&entry);
+/// Incremental parse state of one Codex rollout.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CodexTranscriptState {
+    project_dir: Option<String>,
+    thread_name: Option<String>,
+    last_user_prompt: Option<String>,
+    status: Option<AgentStatus>,
+    last_entry_is_tool_call: bool,
+    /// Rollouts of Codex's own subagents are not conversations of their own.
+    subagent: bool,
+    saw_entry: bool,
+}
+
+impl TailState for CodexTranscriptState {
+    fn apply_line(&mut self, line: &str) {
+        let Ok(entry) = serde_json::from_str::<Value>(line) else {
+            return;
+        };
+        self.saw_entry = true;
+        if entry.get("type").and_then(Value::as_str) == Some("session_meta")
+            && is_codex_subagent_session_meta(&entry)
+        {
+            self.subagent = true;
         }
-        if thread_name.is_none() {
-            thread_name = extract_codex_thread_name(&entry);
+        if self.project_dir.is_none() {
+            self.project_dir = extract_codex_project_dir(&entry);
         }
         if let Some(prompt) = extract_codex_user_prompt(&entry) {
-            if thread_name.is_none() {
-                thread_name = normalize_thread_name(&prompt);
+            if self.thread_name.is_none() {
+                self.thread_name = normalize_thread_name(&prompt);
             }
-            last_user_prompt = Some(prompt);
+            self.last_user_prompt = Some(prompt);
         }
         if let Some(next_status) = determine_codex_status(&entry) {
-            status = next_status;
-            last_entry_is_tool_call = is_codex_tool_call_entry(&entry);
+            self.status = Some(next_status);
+            self.last_entry_is_tool_call = is_codex_tool_call_entry(&entry);
         }
     }
+}
 
-    if !saw_entry {
-        return None;
+impl CodexTranscriptState {
+    pub fn snapshot(
+        &self,
+        thread_id: &str,
+        indexed_thread_name: Option<&str>,
+        mtime_ms: u64,
+        now_ms: u64,
+    ) -> Option<AgentWatcherSnapshot> {
+        if !self.saw_entry || self.subagent {
+            return None;
+        }
+        let mut status = self.status.unwrap_or(AgentStatus::Idle);
+        let idle_for = now_ms.saturating_sub(mtime_ms);
+        if status == AgentStatus::Running
+            && self.last_entry_is_tool_call
+            && idle_for >= TOOL_USE_WAIT_MS
+        {
+            status = AgentStatus::Waiting;
+        }
+        if matches!(status, AgentStatus::Running | AgentStatus::Waiting) && idle_for >= STUCK_MS {
+            status = AgentStatus::Stale;
+        }
+        Some(AgentWatcherSnapshot {
+            agent: "codex",
+            thread_id: Some(thread_id.to_string()),
+            thread_name: indexed_thread_name
+                .map(ToString::to_string)
+                .or_else(|| self.thread_name.clone()),
+            last_user_prompt: self.last_user_prompt.clone(),
+            project_dir: self.project_dir.clone(),
+            status,
+            ts: mtime_ms,
+        })
     }
+}
 
-    let idle_for = now_ms.saturating_sub(mtime_ms);
-    if status == AgentStatus::Running && last_entry_is_tool_call && idle_for >= TOOL_USE_WAIT_MS {
-        status = AgentStatus::Waiting;
-    }
-    if matches!(status, AgentStatus::Running | AgentStatus::Waiting) && idle_for >= STUCK_MS {
-        status = AgentStatus::Stale;
-    }
-
-    Some(AgentWatcherSnapshot {
-        agent: "codex",
-        thread_id: Some(thread_id.to_string()),
-        thread_name,
-        last_user_prompt,
-        project_dir,
-        status,
-        ts: mtime_ms,
-    })
+fn is_codex_subagent_session_meta(entry: &Value) -> bool {
+    entry.pointer("/payload/source/subagent").is_some()
+        || matches!(
+            entry
+                .pointer("/payload/thread_source")
+                .and_then(Value::as_str),
+            Some("subagent" | "subagent_review" | "subagent_thread_spawn")
+        )
 }
 
 pub fn opencode_snapshot_from_row(
@@ -421,24 +614,8 @@ fn extract_claude_custom_title(entry: &Value) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn extract_claude_user_prompt(entry: &Value) -> Option<String> {
-    if entry.pointer("/message/role").and_then(Value::as_str) != Some("user") {
-        return None;
-    }
-    let text = content_text(entry.pointer("/message/content"))?;
-    if text.starts_with('<')
-        || text.starts_with('{')
-        || text.starts_with("[Request")
-        || text.contains("<command-name>/")
-    {
-        return None;
-    }
-    normalize_prompt(&text)
-}
-
-fn is_claude_tool_use_entry(entry: &Value) -> bool {
-    entry.pointer("/message/role").and_then(Value::as_str) == Some("assistant")
-        && content_has_type(entry.pointer("/message/content"), "tool_use")
+fn is_noise_user_text(text: &str) -> bool {
+    text.starts_with('<') || text.starts_with('{')
 }
 
 fn extract_codex_project_dir(entry: &Value) -> Option<String> {
@@ -449,61 +626,6 @@ fn extract_codex_project_dir(entry: &Value) -> Option<String> {
             .map(ToString::to_string),
         _ => None,
     }
-}
-
-fn extract_codex_thread_name(entry: &Value) -> Option<String> {
-    if entry.get("type").and_then(Value::as_str) == Some("event_msg")
-        && entry.pointer("/payload/type").and_then(Value::as_str) == Some("user_message")
-    {
-        let message = entry.pointer("/payload/message").and_then(Value::as_str)?;
-        if message.starts_with("<codex reminder>") || message.starts_with('<') {
-            return None;
-        }
-        let prompt = normalize_codex_user_prompt(message)?;
-        return normalize_thread_name(&prompt);
-    }
-
-    if entry.get("type").and_then(Value::as_str) == Some("response_item")
-        && entry.pointer("/payload/type").and_then(Value::as_str) == Some("message")
-        && entry.pointer("/payload/role").and_then(Value::as_str) == Some("user")
-    {
-        let text = entry
-            .pointer("/payload/content")
-            .and_then(Value::as_array)?
-            .iter()
-            .filter(|item| item.get("type").and_then(Value::as_str) == Some("input_text"))
-            .filter_map(|item| item.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let candidate = normalize_thread_name(&text)?;
-        if is_codex_internal_prompt(&candidate) {
-            return None;
-        }
-        return Some(candidate);
-    }
-
-    if entry.get("type").and_then(Value::as_str) == Some("message")
-        && entry.get("role").and_then(Value::as_str) == Some("user")
-    {
-        let text = entry
-            .get("content")
-            .and_then(Value::as_array)?
-            .iter()
-            .filter(|item| item.get("type").and_then(Value::as_str) == Some("input_text"))
-            .filter_map(|item| item.get("text").and_then(Value::as_str))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let candidate = normalize_thread_name(&text)?;
-        if candidate.starts_with('<')
-            || candidate.starts_with('{')
-            || candidate.starts_with("# AGENTS.md")
-        {
-            return None;
-        }
-        return Some(candidate);
-    }
-
-    None
 }
 
 fn extract_codex_user_prompt(entry: &Value) -> Option<String> {
@@ -546,11 +668,15 @@ fn extract_codex_user_prompt(entry: &Value) -> Option<String> {
     None
 }
 
+/// The user's own words out of a Codex user message: everything after the
+/// last `## My request for Codex:` marker (the IDE prepends context blocks
+/// before it), rejecting messages that are only injected context (F041).
 fn normalize_codex_user_prompt(text: &str) -> Option<String> {
-    let prompt = text
-        .strip_prefix("## My request for Codex:")
-        .unwrap_or(text)
-        .trim();
+    const REQUEST_MARKER: &str = "## My request for Codex:";
+    let prompt = match text.rfind(REQUEST_MARKER) {
+        Some(index) => &text[index + REQUEST_MARKER.len()..],
+        None => text,
+    };
     let candidate = normalize_prompt(prompt)?;
     (!is_codex_internal_prompt(&candidate)).then_some(candidate)
 }
@@ -635,13 +761,11 @@ fn is_codex_tool_call_entry(entry: &Value) -> bool {
 }
 
 fn is_codex_internal_prompt(candidate: &str) -> bool {
-    candidate.starts_with("# AGENTS.md")
-        || candidate.starts_with("<environment_context>")
-        || candidate.starts_with("<codex reminder>")
-        || candidate.starts_with("<permissions ")
-        || candidate.starts_with("<app-context>")
-        || candidate.starts_with("<collaboration_mode>")
-        || candidate.starts_with("<turn_aborted>")
+    candidate.starts_with('<')
+        || candidate.starts_with('{')
+        || candidate.starts_with("# AGENTS.md")
+        || candidate.starts_with("# Context from my IDE")
+        || candidate.starts_with("# Files mentioned by the user")
 }
 
 fn normalize_thread_name(text: &str) -> Option<String> {
@@ -814,6 +938,160 @@ mod tests {
         assert_eq!(snapshot.thread_name.as_deref(), Some("Implement auth"));
         assert_eq!(snapshot.last_user_prompt.as_deref(), Some("Add tests too"));
         assert_eq!(snapshot.status, AgentStatus::Running);
+    }
+
+    #[test]
+    fn claude_state_skips_meta_entries_prefers_last_prompt_records_and_reads_cwd() {
+        let raw = r#"
+{"type":"user","cwd":"/repo/sub","sessionId":"s1","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>noise"}}
+{"type":"user","cwd":"/repo/sub","sessionId":"s1","message":{"role":"user","content":"Implement auth"}}
+{"type":"last-prompt","sessionId":"s1","lastPrompt":"Implement auth"}
+{"type":"assistant","cwd":"/repo/sub","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash"}],"stop_reason":"tool_use"}}
+{"type":"user","cwd":"/repo/sub","message":{"role":"user","content":[{"type":"tool_result","content":"ok"}]}}
+{"type":"user","cwd":"/repo/sub","isCompactSummary":true,"message":{"role":"user","content":"This session is being continued from a previous conversation"}}
+{"type":"custom-title","sessionId":"s1","customTitle":"auth work"}
+{"type":"assistant","cwd":"/repo/sub","message":{"role":"assistant","content":[{"type":"text","text":"Done"}],"stop_reason":"end_turn"}}
+"#;
+        let mut state = ClaudeTranscriptState::default();
+        for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+            state.apply_line(line);
+        }
+
+        assert_eq!(state.cwd.as_deref(), Some("/repo/sub"));
+        assert_eq!(state.session_id.as_deref(), Some("s1"));
+        let hint = state.hint();
+        assert_eq!(hint.thread_name.as_deref(), Some("auth work"));
+        assert_eq!(hint.last_user_prompt.as_deref(), Some("Implement auth"));
+        assert_eq!(hint.last_entry, LastEntry::AssistantEndTurn);
+
+        let snapshot = state
+            .snapshot("s1", "/decoded/fallback", 1_000, 1_100)
+            .expect("snapshot");
+        assert_eq!(snapshot.project_dir.as_deref(), Some("/repo/sub"));
+        assert_eq!(snapshot.thread_name.as_deref(), Some("auth work"));
+        assert_eq!(snapshot.status, AgentStatus::Done);
+    }
+
+    #[test]
+    fn claude_state_classifies_the_last_entry_for_registry_refinement() {
+        let mut state = ClaudeTranscriptState::default();
+        let apply = |state: &mut ClaudeTranscriptState, line: &str| state.apply_line(line);
+
+        apply(
+            &mut state,
+            r#"{"type":"user","message":{"role":"user","content":"Fix it"}}"#,
+        );
+        assert_eq!(state.hint().last_entry, LastEntry::UserPrompt);
+
+        apply(
+            &mut state,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"hmm"}]}}"#,
+        );
+        assert_eq!(state.hint().last_entry, LastEntry::Other);
+
+        apply(
+            &mut state,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Agent"}],"stop_reason":"tool_use"}}"#,
+        );
+        assert_eq!(state.hint().last_entry, LastEntry::AssistantToolUse);
+
+        apply(
+            &mut state,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","content":"done"}]}}"#,
+        );
+        assert_eq!(state.hint().last_entry, LastEntry::ToolResult);
+
+        // Interleaved metadata does not disturb the classification.
+        apply(
+            &mut state,
+            r#"{"type":"file-history-snapshot","messageId":"m"}"#,
+        );
+        apply(
+            &mut state,
+            r#"{"type":"system","subtype":"turn_duration","durationMs":5}"#,
+        );
+        assert_eq!(state.hint().last_entry, LastEntry::ToolResult);
+
+        apply(
+            &mut state,
+            r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}}"#,
+        );
+        assert_eq!(state.hint().last_entry, LastEntry::Interrupted);
+        assert_eq!(
+            state.snapshot("s", "/r", 1, 2).unwrap().status,
+            AgentStatus::Interrupted
+        );
+
+        apply(
+            &mut state,
+            r#"{"type":"assistant","isApiErrorMessage":true,"message":{"role":"assistant","content":[{"type":"text","text":"API Error: overloaded"}]}}"#,
+        );
+        assert_eq!(state.hint().last_entry, LastEntry::ApiError);
+        assert_eq!(
+            state.snapshot("s", "/r", 1, 2).unwrap().status,
+            AgentStatus::Error
+        );
+
+        apply(
+            &mut state,
+            r#"{"type":"user","message":{"role":"user","content":"<command-name>/exit</command-name>"}}"#,
+        );
+        assert_eq!(
+            state.snapshot("s", "/r", 1, 2).unwrap().status,
+            AgentStatus::Done
+        );
+    }
+
+    #[test]
+    fn claude_state_promotes_silence_to_waiting_and_stale_only_for_the_fallback_snapshot() {
+        let mut state = ClaudeTranscriptState::default();
+        state.apply_line(r#"{"type":"user","message":{"role":"user","content":"go"}}"#);
+        state.apply_line(r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash"}]}}"#);
+
+        assert_eq!(
+            state.snapshot("s", "/r", 1_000, 2_000).unwrap().status,
+            AgentStatus::Running
+        );
+        assert_eq!(
+            state.snapshot("s", "/r", 1_000, 5_000).unwrap().status,
+            AgentStatus::Waiting
+        );
+        assert_eq!(
+            state.snapshot("s", "/r", 1_000, 20_000).unwrap().status,
+            AgentStatus::Stale
+        );
+        assert_eq!(state.hint().last_entry, LastEntry::AssistantToolUse);
+    }
+
+    #[test]
+    fn codex_state_rejects_injected_context_and_subagent_rollouts() {
+        let raw = r###"
+{"type":"session_meta","payload":{"id":"abc","cwd":"/repo"}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# Context from my IDE setup:\nlots of stuff"}]}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<recommended_plugins>x</recommended_plugins>"}]}}
+{"type":"event_msg","payload":{"type":"user_message","message":"<environment_context>\n</environment_context>\n## My request for Codex:\n\nFix the flaky watcher"}}
+{"type":"event_msg","payload":{"type":"task_complete"}}
+"###;
+        let mut state = CodexTranscriptState::default();
+        for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+            state.apply_line(line);
+        }
+        let snapshot = state.snapshot("abc", None, 1_000, 1_100).expect("snapshot");
+        assert_eq!(
+            snapshot.thread_name.as_deref(),
+            Some("Fix the flaky watcher")
+        );
+        assert_eq!(
+            snapshot.last_user_prompt.as_deref(),
+            Some("Fix the flaky watcher")
+        );
+        assert_eq!(snapshot.project_dir.as_deref(), Some("/repo"));
+        assert_eq!(snapshot.status, AgentStatus::Done);
+
+        let mut subagent = CodexTranscriptState::default();
+        subagent.apply_line(r#"{"type":"session_meta","payload":{"id":"sub","cwd":"/repo","source":{"subagent":{"thread_spawn":{}}}}}"#);
+        subagent.apply_line(r#"{"type":"event_msg","payload":{"type":"task_started"}}"#);
+        assert!(subagent.snapshot("sub", None, 1_000, 1_100).is_none());
     }
 
     #[test]

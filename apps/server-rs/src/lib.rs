@@ -13,13 +13,13 @@ use std::time::{Instant, SystemTime};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use futures_util::{SinkExt, StreamExt};
 use opensessions_runtime::agent_watchers::{
-    AgentWatcherSnapshot, amp_snapshot_from_thread_json, claude_code_projects_dirs,
-    claude_code_snapshot_from_jsonl, codex_snapshot_from_jsonl, codex_thread_id_from_path,
+    AgentWatcherSnapshot, ClaudeTranscriptState, CodexTranscriptState,
+    amp_snapshot_from_thread_json, claude_code_projects_dirs, codex_thread_id_from_path,
     decode_claude_project_dir, droid_snapshot_from_jsonl, opencode_snapshot_from_row,
     parse_codex_session_index, pi_snapshot_from_jsonl,
 };
 use opensessions_runtime::claude_registry::{
-    CLAUDE_CODE_AGENT, RegistryResolver, ResolvedRecord, SystemProcessInspector,
+    CLAUDE_CODE_AGENT, RecordLiveness, RegistryResolver, ResolvedRecord, SystemProcessInspector,
     claude_code_config_dirs, scan_registry,
 };
 use opensessions_runtime::config::{
@@ -33,7 +33,7 @@ use opensessions_runtime::mux::{ActiveWindow, ClientFocus, MuxPane, MuxProvider,
 use opensessions_runtime::pi_runtime_registry::{PiRuntimeRegistry, parse_pi_runtime_info};
 use opensessions_runtime::port_discovery::{PortDiscoveryInput, discover_session_ports};
 use opensessions_runtime::project_dir_session::{
-    build_dir_session_map, resolve_session_for_project_dir,
+    DirSessionMap, build_dir_session_map, resolve_session_for_project_dir_preferring,
 };
 use opensessions_runtime::protocol::{
     AgentEvent, AgentLiveness, AgentPanelScope, AgentStatus, MetadataTone, ProtocolHello,
@@ -43,8 +43,9 @@ use opensessions_runtime::server_state::{ReadOnlyStateInput, build_read_only_sta
 use opensessions_runtime::session_order::SessionOrder;
 use opensessions_runtime::sidebar_coordinator::SidebarCoordinator;
 use opensessions_runtime::sidebar_width_sync::clamp_sidebar_width;
-use opensessions_runtime::tmux_provider::{StdCommandRunner, TmuxProvider};
+use opensessions_runtime::tmux_provider::{StdCommandRunner, TmuxProvider, agent_panes_from};
 use opensessions_runtime::tracker::{AgentTracker, RegistryInput, Source};
+use opensessions_runtime::transcript_tail::TailCache;
 use opensessions_sidebar_core::app::App as SidebarApp;
 use opensessions_sidebar_core::generated::protocol::ServerMessage as SidebarServerMessage;
 use serde_json::Value;
@@ -387,8 +388,18 @@ pub struct ReadOnlyMuxStateSource {
     /// this mux (another tmux server, or no tmux at all): the transcript
     /// watcher must not attribute them to one of our sessions by directory.
     foreign_claude_sessions: Mutex<HashSet<String>>,
+    /// Live Claude Code sessions of this mux, for transcript enrichment.
+    claude_registry_threads: Mutex<Vec<RegistryThread>>,
     pi_runtime_registry: Mutex<PiRuntimeRegistry>,
     now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
+}
+
+/// A live registry-backed Claude Code session and where its transcript is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegistryThread {
+    session_id: String,
+    cwd: Option<String>,
+    config_dir: PathBuf,
 }
 
 pub fn default_state_source_from_env(
@@ -456,6 +467,7 @@ impl ReadOnlyMuxStateSource {
             agent_tracker: Mutex::new(AgentTracker::new()),
             registry_resolver: Mutex::new(RegistryResolver::new()),
             foreign_claude_sessions: Mutex::new(HashSet::new()),
+            claude_registry_threads: Mutex::new(Vec::new()),
             pi_runtime_registry: Mutex::new(PiRuntimeRegistry::with_default_ttl()),
             now_ms: Arc::new(current_time_ms),
         }
@@ -623,19 +635,25 @@ impl ReadOnlyMuxStateSource {
                 .resolve(records, panes, &SystemProcessInspector);
         let mut inputs = Vec::new();
         let mut foreign = HashSet::new();
+        let mut threads = Vec::new();
         for ResolvedRecord {
             record,
             liveness,
             pane,
         } in resolved
         {
-            if liveness != opensessions_runtime::claude_registry::RecordLiveness::Alive {
+            if liveness != RecordLiveness::Alive {
                 continue;
             }
             let Some(pane) = pane else {
                 foreign.insert(record.session_id);
                 continue;
             };
+            threads.push(RegistryThread {
+                session_id: record.session_id.clone(),
+                cwd: record.cwd.clone(),
+                config_dir: record.config_dir.clone(),
+            });
             inputs.push(RegistryInput {
                 thread_id: record.session_id,
                 session: pane.session_name,
@@ -650,6 +668,7 @@ impl ReadOnlyMuxStateSource {
             });
         }
         *self.foreign_claude_sessions.lock().unwrap() = foreign;
+        *self.claude_registry_threads.lock().unwrap() = threads;
         let now = (self.now_ms)();
         let changed = self
             .agent_tracker
@@ -659,6 +678,41 @@ impl ReadOnlyMuxStateSource {
         if changed {
             debug_log("claude-registry applied changes");
         }
+        changed
+    }
+
+    /// Refresh the transcripts of live registry sessions and hand their tail
+    /// state to the tracker. Returns whether any row changed.
+    fn enrich_claude_registry_rows(&self, tails: &mut TranscriptTails) -> bool {
+        let threads = self.claude_registry_threads.lock().unwrap().clone();
+        let mut changed = false;
+        let mut hints = Vec::new();
+        for thread in &threads {
+            let Some(path) = tails.claude_transcript_path(thread) else {
+                continue;
+            };
+            let Some(tail) = tails.claude.refresh(&path) else {
+                continue;
+            };
+            if tail.changed || !tails.hinted.contains(&thread.session_id) {
+                hints.push((thread.session_id.clone(), tail.state.hint()));
+            }
+        }
+        if !hints.is_empty() {
+            let mut tracker = self.agent_tracker.lock().unwrap();
+            for (session_id, hint) in hints {
+                changed = tracker.apply_transcript_hint(&session_id, hint) || changed;
+                tails.hinted.insert(session_id);
+            }
+        }
+        let live = threads
+            .iter()
+            .map(|thread| thread.session_id.clone())
+            .collect::<HashSet<_>>();
+        tails.hinted.retain(|session_id| live.contains(session_id));
+        tails
+            .claude_paths
+            .retain(|session_id, _| live.contains(session_id));
         changed
     }
 
@@ -1304,7 +1358,12 @@ impl ReadOnlyMuxStateSource {
         Ok(())
     }
 
-    fn apply_agent_watcher_snapshot(&self, snapshot: AgentWatcherSnapshot) -> bool {
+    fn apply_agent_watcher_snapshot(
+        &self,
+        snapshot: AgentWatcherSnapshot,
+        dir_session_map: &DirSessionMap,
+        panes: &[MuxPane],
+    ) -> bool {
         if snapshot.status == AgentStatus::Idle {
             debug_log(format!(
                 "watcher-snapshot ignored idle agent={} thread_id={:?} thread_name={:?} project_dir={:?}",
@@ -1326,7 +1385,8 @@ impl ReadOnlyMuxStateSource {
             ));
             return false;
         }
-        let Some(session) = self.resolve_agent_watcher_session(&snapshot) else {
+        let Some(session) = self.resolve_agent_watcher_session(&snapshot, dir_session_map, panes)
+        else {
             debug_log(format!(
                 "watcher-snapshot unresolved agent={} status={:?} thread_id={:?} thread_name={:?} project_dir={:?}",
                 snapshot.agent,
@@ -1365,33 +1425,36 @@ impl ReadOnlyMuxStateSource {
             .apply_event_from(event, Source::Transcript)
     }
 
-    fn resolve_agent_watcher_session(&self, snapshot: &AgentWatcherSnapshot) -> Option<String> {
-        let sessions = self
-            .providers
-            .iter()
-            .flat_map(|provider| provider.list_sessions())
-            .collect::<Vec<_>>();
+    /// Attribute a transcript snapshot to a session by its directory; a tie
+    /// between sessions at the same directory goes to the one with a live
+    /// pane of that agent.
+    fn resolve_agent_watcher_session(
+        &self,
+        snapshot: &AgentWatcherSnapshot,
+        dir_session_map: &DirSessionMap,
+        panes: &[MuxPane],
+    ) -> Option<String> {
         let project_dir = snapshot.project_dir.as_deref()?;
-
-        if let Some(encoded) = project_dir.strip_prefix("__encoded__:") {
-            return sessions
-                .iter()
-                .find(|session| encode_agent_project_dir(&session.dir) == encoded)
-                .map(|session| session.name.clone());
-        }
-
-        self.resolve_session_for_project_dir(project_dir)
+        let preferred = sessions_with_agent_pane(panes, snapshot.agent);
+        resolve_session_for_project_dir_preferring(project_dir, dir_session_map, &preferred)
     }
 
-    /// Resolve a project/worktree directory to a session across providers.
-    fn resolve_session_for_project_dir(&self, project_dir: &str) -> Option<String> {
-        let dir_session_map = build_dir_session_map(
+    fn dir_session_map(&self) -> DirSessionMap {
+        build_dir_session_map(
             self.providers
                 .iter()
                 .flat_map(|provider| provider.list_sessions())
                 .map(|session| (session.name, session.dir)),
-        );
-        resolve_session_for_project_dir(project_dir, &dir_session_map)
+        )
+    }
+
+    /// Resolve a project/worktree directory to a session across providers.
+    fn resolve_session_for_project_dir(&self, project_dir: &str) -> Option<String> {
+        resolve_session_for_project_dir_preferring(
+            project_dir,
+            &self.dir_session_map(),
+            &HashSet::new(),
+        )
     }
 
     fn resolve_agent_event_session(&self, body: &Value) -> Option<String> {
@@ -1407,7 +1470,17 @@ impl ReadOnlyMuxStateSource {
                     .iter()
                     .map(|session| (session.name.clone(), session.dir.clone())),
             );
-            if let Some(session) = resolve_session_for_project_dir(project_dir, &dir_session_map) {
+            let agent = body
+                .get("agent")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let (panes, _) = self.observe_mux();
+            let preferred = sessions_with_agent_pane(&panes, agent);
+            if let Some(session) = resolve_session_for_project_dir_preferring(
+                project_dir,
+                &dir_session_map,
+                &preferred,
+            ) {
                 return Some(session);
             }
         }
@@ -1969,6 +2042,7 @@ async fn run_agent_watcher_loop(
     let mut last_seen = HashMap::<String, AgentWatcherFingerprint>::new();
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let mut tick = 0_u32;
+    let mut tails = Some(TranscriptTails::default());
 
     loop {
         tokio::select! {
@@ -1985,13 +2059,31 @@ async fn run_agent_watcher_loop(
 
                 if tick.is_multiple_of(AGENT_TRANSCRIPT_TICK_EVERY) {
                     let now = current_time_ms();
-                    let snapshots = tokio::task::spawn_blocking(move || scan_agent_watcher_snapshots(now))
-                        .await
-                        .unwrap_or_default();
+                    // Transcripts of live registry sessions are enrichment,
+                    // not snapshots; the recent-file scan skips them.
+                    let registry_threads = source
+                        .claude_registry_threads
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|thread| thread.session_id.clone())
+                        .collect::<HashSet<_>>();
+                    let mut scan_tails = tails.take().unwrap_or_default();
+                    let (snapshots, scan_tails) = tokio::task::spawn_blocking(move || {
+                        let snapshots =
+                            scan_agent_watcher_snapshots(now, &mut scan_tails, &registry_threads);
+                        (snapshots, scan_tails)
+                    })
+                    .await
+                    .unwrap_or_default();
+                    let mut scan_tails = scan_tails;
+                    changed = source.enrich_claude_registry_rows(&mut scan_tails) || changed;
+                    tails = Some(scan_tails);
                     debug_log(format!(
                         "agent_watcher_loop: tick scanned {} snapshots",
                         snapshots.len()
                     ));
+                    let dir_session_map = source.dir_session_map();
                     let mut keys_this_tick = HashSet::new();
                     for snapshot in snapshots {
                         if snapshot.status == AgentStatus::Idle {
@@ -2006,7 +2098,7 @@ async fn run_agent_watcher_loop(
                         let agent = snapshot.agent.to_string();
                         let status = snapshot.status;
                         let thread_name = snapshot.thread_name.clone();
-                        if source.apply_agent_watcher_snapshot(snapshot) {
+                        if source.apply_agent_watcher_snapshot(snapshot, &dir_session_map, &panes) {
                             debug_log(format!(
                                 "agent_watcher_loop: applied snapshot agent={agent} status={status:?} thread={thread_name:?}",
                             ));
@@ -2062,22 +2154,112 @@ fn agent_watcher_key(snapshot: &AgentWatcherSnapshot) -> String {
     )
 }
 
-fn scan_agent_watcher_snapshots(now_ms: u64) -> Vec<AgentWatcherSnapshot> {
+/// Per-file parse state kept between transcript ticks so large transcripts
+/// are read incrementally (F015).
+#[derive(Default)]
+struct TranscriptTails {
+    claude: TailCache<ClaudeTranscriptState>,
+    codex: TailCache<CodexTranscriptState>,
+    /// Amp thread files are rewritten whole; remember the parse per
+    /// (len, mtime) so an unchanged file is not parsed again.
+    amp: HashMap<PathBuf, (u64, u64, Option<AgentWatcherSnapshot>)>,
+    /// Where each live registry session's transcript was found.
+    claude_paths: HashMap<String, PathBuf>,
+    /// Registry sessions whose transcript hint has been delivered at least
+    /// once.
+    hinted: HashSet<String>,
+}
+
+impl TranscriptTails {
+    /// The transcript of a registry session: under the project folder named
+    /// after its cwd, or wherever a file with its id lives under that config
+    /// directory (the cwd may have been recorded differently).
+    fn claude_transcript_path(&mut self, thread: &RegistryThread) -> Option<PathBuf> {
+        if let Some(path) = self.claude_paths.get(&thread.session_id)
+            && path.is_file()
+        {
+            return Some(path.clone());
+        }
+        let file_name = format!("{}.jsonl", thread.session_id);
+        let projects = thread.config_dir.join("projects");
+        let candidate = thread
+            .cwd
+            .as_deref()
+            .map(|cwd| {
+                projects
+                    .join(encode_agent_project_dir(cwd))
+                    .join(&file_name)
+            })
+            .filter(|path| path.is_file())
+            .or_else(|| {
+                fs::read_dir(&projects)
+                    .ok()?
+                    .flatten()
+                    .map(|entry| entry.path().join(&file_name))
+                    .find(|path| path.is_file())
+            })?;
+        self.claude_paths
+            .insert(thread.session_id.clone(), candidate.clone());
+        Some(candidate)
+    }
+
+    fn forget_stale(&mut self, now_ms: u64) {
+        let recent = |path: &Path| {
+            file_mtime_ms(path)
+                .is_some_and(|mtime| now_ms.saturating_sub(mtime) <= AGENT_WATCHER_RECENT_MS)
+        };
+        let keep_claude = self.claude_paths.values().cloned().collect::<HashSet<_>>();
+        self.claude
+            .retain(|path| keep_claude.contains(path) || recent(path));
+        self.codex.retain(recent);
+        self.amp.retain(|path, _| recent(path));
+    }
+}
+
+/// Sessions that show a live pane of `agent`, used to settle same-directory
+/// attribution ties.
+fn sessions_with_agent_pane(panes: &[MuxPane], agent: &str) -> HashSet<String> {
+    let by_pane = panes
+        .iter()
+        .map(|pane| (pane.pane_id.as_str(), pane.session_name.as_str()))
+        .collect::<HashMap<_, _>>();
+    agent_panes_from(panes)
+        .into_iter()
+        .filter(|pane| pane.agent == agent)
+        .filter_map(|pane| {
+            by_pane
+                .get(pane.pane_id.as_str())
+                .map(|session| (*session).to_string())
+        })
+        .collect()
+}
+
+fn scan_agent_watcher_snapshots(
+    now_ms: u64,
+    tails: &mut TranscriptTails,
+    skip_claude_threads: &HashSet<String>,
+) -> Vec<AgentWatcherSnapshot> {
     let mut snapshots = Vec::new();
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return snapshots;
     };
 
-    scan_amp_threads(&home, now_ms, &mut snapshots);
-    scan_claude_code_projects(&home, now_ms, &mut snapshots);
-    scan_codex_sessions(&home, now_ms, &mut snapshots);
+    scan_amp_threads(&home, now_ms, tails, &mut snapshots);
+    scan_claude_code_projects(&home, now_ms, tails, skip_claude_threads, &mut snapshots);
+    scan_codex_sessions(&home, now_ms, tails, &mut snapshots);
     scan_opencode_sessions(&home, now_ms, &mut snapshots);
     scan_pi_sessions(&home, now_ms, &mut snapshots);
     scan_droid_sessions(&home, now_ms, &mut snapshots);
+    tails.forget_stale(now_ms);
     snapshots
 }
 
-fn scan_amp_threads(home: &Path, now_ms: u64, snapshots: &mut Vec<AgentWatcherSnapshot>) {
+fn scan_amp_threads(
+    home: &Path,
+    now_ms: u64,
+    tails: &mut TranscriptTails,
+    snapshots: &mut Vec<AgentWatcherSnapshot>,
+) {
     let threads_dir = home.join(".local/share/amp/threads");
     let Ok(entries) = fs::read_dir(threads_dir) else {
         return;
@@ -2088,30 +2270,52 @@ fn scan_amp_threads(home: &Path, now_ms: u64, snapshots: &mut Vec<AgentWatcherSn
         if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
             continue;
         }
-        let Some(mtime_ms) = file_mtime_ms(&path) else {
+        let Some((len, mtime_ms)) = file_len_and_mtime_ms(&path) else {
             continue;
         };
         if now_ms.saturating_sub(mtime_ms) > AGENT_WATCHER_RECENT_MS {
             continue;
         }
-        let Ok(raw) = fs::read_to_string(&path) else {
-            continue;
+        let snapshot = match tails.amp.get(&path) {
+            Some((cached_len, cached_mtime, snapshot))
+                if *cached_len == len && *cached_mtime == mtime_ms =>
+            {
+                snapshot.clone()
+            }
+            _ => {
+                let Ok(raw) = fs::read_to_string(&path) else {
+                    continue;
+                };
+                let snapshot = amp_snapshot_from_thread_json(&raw, mtime_ms);
+                tails
+                    .amp
+                    .insert(path.clone(), (len, mtime_ms, snapshot.clone()));
+                snapshot
+            }
         };
-        if let Some(snapshot) = amp_snapshot_from_thread_json(&raw, mtime_ms) {
+        if let Some(snapshot) = snapshot {
             snapshots.push(snapshot);
         }
     }
 }
 
-fn scan_claude_code_projects(home: &Path, now_ms: u64, snapshots: &mut Vec<AgentWatcherSnapshot>) {
+fn scan_claude_code_projects(
+    home: &Path,
+    now_ms: u64,
+    tails: &mut TranscriptTails,
+    skip_threads: &HashSet<String>,
+    snapshots: &mut Vec<AgentWatcherSnapshot>,
+) {
     for projects_dir in claude_code_projects_dirs(home) {
-        scan_claude_code_projects_dir(&projects_dir, now_ms, snapshots);
+        scan_claude_code_projects_dir(&projects_dir, now_ms, tails, skip_threads, snapshots);
     }
 }
 
 fn scan_claude_code_projects_dir(
     projects_dir: &Path,
     now_ms: u64,
+    tails: &mut TranscriptTails,
+    skip_threads: &HashSet<String>,
     snapshots: &mut Vec<AgentWatcherSnapshot>,
 ) {
     let Ok(projects) = fs::read_dir(projects_dir) else {
@@ -2124,7 +2328,7 @@ fn scan_claude_code_projects_dir(
             continue;
         }
         let encoded = project.file_name().to_string_lossy().to_string();
-        let project_dir = decode_claude_project_dir(&encoded, |path| Path::new(path).is_dir());
+        let mut project_dir = None;
         let Ok(files) = fs::read_dir(project_path) else {
             continue;
         };
@@ -2142,11 +2346,20 @@ fn scan_claude_code_projects_dir(
             let Some(thread_id) = path.file_stem().and_then(|stem| stem.to_str()) else {
                 continue;
             };
-            let Ok(raw) = fs::read_to_string(&path) else {
+            if skip_threads.contains(thread_id) {
+                continue;
+            }
+            let Some(tail) = tails.claude.refresh(&path) else {
                 continue;
             };
-            if let Some(snapshot) =
-                claude_code_snapshot_from_jsonl(thread_id, &project_dir, &raw, mtime_ms, now_ms)
+            // Decoding the folder name is lossy; only fall back to it when
+            // no entry carried a cwd.
+            let fallback_dir = project_dir.get_or_insert_with(|| {
+                decode_claude_project_dir(&encoded, |path| Path::new(path).is_dir())
+            });
+            if let Some(snapshot) = tail
+                .state
+                .snapshot(thread_id, fallback_dir, mtime_ms, now_ms)
             {
                 snapshots.push(snapshot);
             }
@@ -2154,7 +2367,12 @@ fn scan_claude_code_projects_dir(
     }
 }
 
-fn scan_codex_sessions(home: &Path, now_ms: u64, snapshots: &mut Vec<AgentWatcherSnapshot>) {
+fn scan_codex_sessions(
+    home: &Path,
+    now_ms: u64,
+    tails: &mut TranscriptTails,
+    snapshots: &mut Vec<AgentWatcherSnapshot>,
+) {
     let codex_home = std::env::var_os("CODEX_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".codex"));
@@ -2179,12 +2397,11 @@ fn scan_codex_sessions(home: &Path, now_ms: u64, snapshots: &mut Vec<AgentWatche
             continue;
         };
         let thread_id = codex_thread_id_from_path(path_text);
-        let Ok(raw) = fs::read_to_string(&path) else {
+        let Some(tail) = tails.codex.refresh(&path) else {
             continue;
         };
-        if let Some(snapshot) = codex_snapshot_from_jsonl(
+        if let Some(snapshot) = tail.state.snapshot(
             &thread_id,
-            &raw,
             names.get(&thread_id).map(String::as_str),
             mtime_ms,
             now_ms,
@@ -2376,13 +2593,18 @@ fn collect_jsonl_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 fn file_mtime_ms(path: &Path) -> Option<u64> {
-    fs::metadata(path)
-        .ok()?
+    file_len_and_mtime_ms(path).map(|(_, mtime)| mtime)
+}
+
+fn file_len_and_mtime_ms(path: &Path) -> Option<(u64, u64)> {
+    let metadata = fs::metadata(path).ok()?;
+    let mtime = metadata
         .modified()
         .ok()?
         .duration_since(SystemTime::UNIX_EPOCH)
         .ok()
-        .map(|duration| duration.as_millis() as u64)
+        .map(|duration| duration.as_millis() as u64)?;
+    Some((metadata.len(), mtime))
 }
 
 fn encode_agent_project_dir(path: &str) -> String {

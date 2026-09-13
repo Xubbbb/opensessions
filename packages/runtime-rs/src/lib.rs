@@ -19,3 +19,4 @@ pub mod sidebar_width_sync;
 pub mod tmux_provider;
 pub mod tmux_scripting;
 pub mod tracker;
+pub mod transcript_tail;
