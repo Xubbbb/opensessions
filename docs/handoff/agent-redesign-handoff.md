@@ -1,81 +1,64 @@
-# Handoff: agent identification redesign
+# Handoff: agent identification (registry-first)
 
-Written 2026-09-13 at the end of the fork's first maintenance session. Read this before touching anything under "agent" in the codebase. The companion file `audit-findings.md` lists every audit finding with its status.
+Written 2026-09-13 at the end of the agent-redesign session, replacing the pre-redesign handoff. Read this before touching anything under "agent" in the codebase. `audit-findings.md` lists every audit finding with its status; the ones closed here are marked `fixed 2026-09-13 (agent redesign)`.
 
 ## 1. Where the repository stands
 
-- Fork: `Xubbbb/opensessions` of the dormant `Ataraxy-Labs/opensessions` (last upstream release v0.2.0-alpha.12). Everything below is committed and pushed; `main` is the working branch.
-- First fork release **v0.2.0-alpha.13** was published on 2026-09-13 by the CI chain (push to `main` → `auto-version` bumps `package.json`, tags, dispatches `release.yml` → four platform bundles). All three GitHub workflows were green, including the tmux E2E that upstream never had green. The user's machine now runs the fork via TPM (`~/.tmux.conf` → `Xubbbb/opensessions`, bundle alpha.13).
-- The history on `main` is ten subsystem commits from the first maintenance session (fork chore, debug log, tmux provider, agents, server, sidebar, e2e, plugin scripts, docs, handoff) plus `scripts/isolated-tmux.sh`. They cover the initial bug-fix pass (release retargeting, `build.rs` version, fish-shell spawn via `split-window -e`, hook array slot 90210, opt-in capped debug log, agent pruning, `/pane-died`, `CLAUDE_CONFIG_DIR`, lsof, uninstall, graceful SIGTERM, tmux utempter SIGCHLD nudge) and 36 audit fixes (see `audit-findings.md`, status `fixed`): exact tmux session targets (`=name:`), width-repair loop guard, session ids in hook bodies, HTTP body cap/timeouts, server exits when its tmux server dies, config `theme`/`sidebarPosition`/`sessionFilter` applied and persisted, session order persisted, proxy-proof loopback curls, `focus.sh` no longer toggling every sidebar off, theme picker/scroll fixes, refocus to the previously active pane.
-- Verified state at v0.2.0-alpha.13: 74 unit tests green; tmux E2E 23/23 locally in most runs (residual flakiness in the agent seen-marking tests that the redesign will make obsolete) and green on CI; `cargo clippy` shows only the 12 warnings upstream already had.
-- `Xubbbb/lazydiff` was re-forked with all tags, so `release.yml`'s `LAZYDIFF_REF: v0.1.0-alpha.18` resolves. `Xubbbb/opensessions` has only its own tags; do **not** push the 53 upstream tags (each tag push would trigger a release build).
-- No `LICENSE` file exists upstream or here despite the MIT badge; the user has been told.
-- To exercise a build without disturbing the user's tmux: `cargo build --release && scripts/isolated-tmux.sh` (own socket/port/hooks; shares `~/.config/opensessions` and agent transcripts on purpose); `scripts/isolated-tmux.sh --stop` tears it down.
+- Fork: `Xubbbb/opensessions` of the dormant `Ataraxy-Labs/opensessions`. `main` is the working branch; every push to `main` publishes a release (auto-version → tag → release build), so work lands on a branch and is fast-forwarded when ready. The redesign was done on branch `agent-redesign` (9 commits on top of v0.2.0-alpha.13's `2e82f85`).
+- Verified state at the end of the session: 124 unit tests green (`cargo test --workspace --exclude opensessions-sidebar` + sidebar lib), tmux E2E 28/28 (`cargo build --workspace --bins && cargo test -p opensessions-sidebar --test tmux_e2e`), `cargo clippy` shows only the warnings upstream already had (one `collapsible_if` in `handle_connection`, seven in sidebar-core).
+- Manually verified with a real `claude` (2.1.270) inside an isolated tmux server (`scripts/isolated-tmux.sh`-style, socket `ostest-verify`): an idle session appears as `✓ <name> / idle · claude-code` within a second of starting; a prompt shows the spinner within 500 ms and `●` when the turn ends in a pane the client is not looking at, `✓` when the pane is the client's active pane; `/exit` removes the row ≈10 s later and the transcript does not bring it back; the user's own Claude sessions in the default tmux server (same directory) never appear in the isolated server.
 
-## 2. How agents are identified today (the thing being redesigned)
+## 2. How agents are identified now
 
-Everything is inference; there is no ground-truth link between a tmux pane and an agent conversation.
+Three sources, in decreasing authority, feed `AgentTracker` (`packages/runtime-rs/src/tracker.rs`):
 
-1. **Discovery.** Two inputs feed `AgentTracker` (`packages/runtime-rs/src/tracker.rs`):
-   - Built-in watchers: `apps/server-rs/src/lib.rs` `scan_amp_threads` / `scan_claude_code_projects` / `scan_codex_sessions` / `scan_opencode_sessions` / `scan_pi_sessions` / `scan_droid_sessions`, driven by `run_agent_watcher_loop` every 2 s. Each re-reads every transcript modified in the last 5 min **in full** and parses it (`packages/runtime-rs/src/agent_watchers.rs`, `agent_parsers.rs`) into an `AgentWatcherSnapshot { agent, thread_id, thread_name, last_user_prompt, project_dir, status, ts = mtime }`. A fingerprint (status, thread_name, prompt, project_dir) suppresses re-applying unchanged snapshots. A 4 MB Claude Code transcript costs ~75 ms CPU and ~145 MB of transient allocation per tick on the user's machine (audit F015/F020/F010).
-   - HTTP `POST /api/agent-event` (`apply_agent_event`), used by `integrations/amp/opensessions.ts`, `integrations/pi-extension/opensessions-runtime.ts` and anything custom; carries `tmuxSession` or `projectDir`, optional `paneId`, `threadId`, `status`, `ts`.
-2. **Identity.** Instance key = `agent:threadId` (`tracker::instance_key`), or `agent` alone. Claude Code's `threadId` is the transcript file stem (the session UUID). Status for Claude Code is guessed from the transcript tail (`agent_parsers::determine_claude_code_status`) plus timing: tool-call silence > 3 s → `waiting`, > 15 s → `stale`.
-3. **Session attribution.** Claude Code's project dir is decoded from the folder name `~/.claude/projects/<dashed-path>` (`decode_claude_project_dir`, lossy for paths containing `-`), then matched to tmux sessions by directory (`project_dir_session::resolve_session_for_project_dir`: exact match, else parent/child prefix; ties → nobody). Session directory = tmux `session_path` or the active pane's cwd (`TmuxProvider::list_sessions`).
-4. **Pane binding.** On every snapshot `sync_agent_pane_presence` lists each session's panes; `tmux_provider::agent_from_pane` calls a pane an agent pane when `pane_current_command`/title contains an alias token (`AGENT_ALIASES`; now whole-word). tmux never knows which conversation a pane runs, so `tracker::apply_pane_presence` binds by thread id (never available from tmux) → thread name (only Amp puts it in the title) → "if exactly one entry of that agent exists in the session, stamp the last listed pane" (F036). That binding drives `Enter` (focus pane), `x` (kill pane), seen-marking when the pane is focused (`focused_pane_by_session`, F013), and prune protection (`liveness == Alive` is never pruned).
-5. **Pruning.** `prune_agents` runs inside every `snapshot_json`: terminal entries go ~10 s after their pane is observed gone (`exited_at`), else after 5 min seen / 30 min unseen; running entries with no live pane after 30 min (`tracker.rs` constants).
+1. **Claude Code session registry** (`packages/runtime-rs/src/claude_registry.rs`). Claude Code ≥ 2.1.x writes `<config>/sessions/<pid>.json` for every interactive process and rewrites it on each status transition. Fields used: `sessionId` (= transcript stem = tracker `threadId`), `tmux` (`session:@window.%pane`, captured at startup), `status ∈ {busy, idle, waiting, shell}`, `waitingFor`, `statusUpdatedAt` (moves only on a real transition), `startedAt`, `name`/`nameSource` (`/rename`), `agent` (teammates), `procStart` (Linux `/proc/<pid>/stat` starttime), `kind` (only `interactive` counts). Config dirs: `~/.claude`, `$CLAUDE_CONFIG_DIR`, `~/.claude*` siblings holding `projects/` or `sessions/`.
+   - `RegistryResolver` decides liveness (pid exists and start token matches) and ownership: a record is ours iff one of our panes' `pane_pid` is an ancestor of the record's pid (cached per pid incarnation; `/proc` on Linux, `ps -o ppid=` elsewhere). The pane id in the record is a hint only — every tmux server numbers panes from `%0`.
+   - Server side (`apps/server-rs/src/lib.rs` `apply_claude_registry`): polled every 500 ms by `run_agent_watcher_loop`; live+ours records become `RegistryInput`s; records that are alive but not ours go into `foreign_claude_sessions`; sessions that just left the live set go into `claude_retired_sessions` (kept for `AGENT_WATCHER_RECENT_MS`). Both sets stop the transcript fallback from creating rows for those session ids.
+2. **`/api/agent-event`** (`apply_agent_event`): unchanged shape plus `ts` normalisation (seconds → ms, future → now); `paneId` is an explicit binding; `unseen`/`liveness`/`detail` from clients are ignored.
+3. **Transcript watchers** (`packages/runtime-rs/src/agent_watchers.rs`, `transcript_tail.rs`): Claude Code and Codex transcripts are parsed incrementally (`TailCache` keeps offset + parse state per file; a shrunk file is re-parsed). For Claude sessions with a registry record the transcript only produces a `TranscriptHint` (custom title, last prompt from Claude's `last-prompt` records, classification of the last entry) delivered through `enrich_claude_registry_rows`; for sessions without a record the old inference remains (`ClaudeTranscriptState::snapshot`: status from the last entry, tool-use silence ≥ 3 s → `waiting`, ≥ 15 s → `stale`, project dir from the entries' `cwd`). Amp files are parsed once per (len, mtime); OpenCode/Pi/Droid are unchanged.
 
-Verified fact for the redesign: a Claude Code process launched inside tmux inherits `TMUX_PANE` (checked from a live session: `TMUX_PANE=%136`, `tmux display-message -t %136 '#{session_name} #{pane_current_command}'` → `opensessions claude`). Claude Code hook events (`SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Notification`, `Stop`, `SubagentStart`/`SubagentStop`, `SessionEnd`) receive `session_id`, `cwd`, `transcript_path`, `hook_event_name` (plus `notification_type`, `tool_name`, `agent_id`… per event) on stdin, and run with the process environment. The user's `~/.claude/settings.json` currently has no hooks configured.
+### Tracker rules (`tracker.rs`)
+- Key `agent:threadId` per session; a row relocates (keeping its unseen marker) when its bound pane moves to another session.
+- Bindings: `Explicit(pane)` from registry/`paneId`; `Heuristic(pane)` only for non-registry rows, only when exactly one free agent-looking pane and one candidate row of that agent exist in the session (Amp titles bind by name first), never restamped while the pane exists, dropped when it disappears.
+- Registry transitions: `busy` → running (refined to `tool-running` when the transcript's last assistant entry is an unanswered tool call, or `running (delegating)` when the assistant's own turn ended); `waiting` → waiting with `detail = waitingFor`; `busy/waiting → idle` → done + unseen (also when `statusUpdatedAt` advanced while status stayed idle: the transition happened between polls); `→ shell` → done (shell running) + unseen; `shell → idle` clears the detail only. Done is refined to interrupted/error by the transcript hint. First observation of an idle session is a seen `idle` row. A record with the same pid but a new session id (`/clear`) replaces the old row immediately.
+- Seen rule: `sync_panes` marks seen every row bound to the current pane of an attached client (`tmux list-clients`), on every sync; the `/focus` hook does the same for its pane when `pane_active`. Nothing about focus is remembered (F013). Serialized `unseen` derives only from the unseen set (F042).
+- Liveness: an explicit/heuristic pane that is missing from `list-panes -a` marks the row gone; a registry row is also gone when its record is absent/dead, and a surviving pane does **not** revive it (only a live record does). Rows of sessions that no longer exist are gone too (F043).
+- Prune: gone for > `EXITED_PRUNE_MS` (10 s) → removed whatever the status; never-bound rows: terminal after 5 min seen / 30 min unseen, others after 30 min silence; rows bound to a live pane never.
+- Server sync (`sync_agents`): one `list-panes -a` + one `list-clients` per snapshot (was `list-sessions` + one `list-panes` per session); `prune` and the Pi runtime registry prune run there too. The watcher loop reuses the tick's pane listing for the sync, lists sessions once per transcript tick, and broadcasts one snapshot per tick when anything changed.
 
-## 3. Open defects in this pipeline (deferred to the redesign)
+### Contract changes
+- `AgentEvent.detail?: string` (protocol 1, additive). Sidebar renders it as `label (detail) · agent`.
+- Session resolution: bound pane > `projectDir` (deepest ancestor wins, same-dir tie settled by a live agent pane, F016/F118) > `tmuxSession`.
+- Documented in `CONTRACTS.md`, `AGENTS.md`, `README.md`, `docs/reference/features-and-keybindings.md`, `docs/explanation/architecture.md`.
 
-From `audit-findings.md`, status `agent redesign` (ids refer to that file):
+## 3. Product decisions taken (with the maintainer)
 
-- F013 (high) background-session panes stay in `focused_pane_by_session` forever → finished agents there are marked seen instantly; no unseen dot.
-- F036 (high) single-entry pane attachment stamps the last listed pane and is never re-evaluated → kill/focus/seen route to the wrong Claude/Codex pane.
-- F039 project-dir decoding trusts the dash→slash guess; F016 ancestor-directory sessions make nested agents unresolvable; F118 two sessions in one directory resolve to nobody.
-- F035/F110 custom HTTP agents lose `paneId` on the first snapshot and get reaped ~10 s later; F038 waiting/idle entries are never pruned; F037 fresh events clear `exited_at`; F042 `mark_seen` leaves `event.unseen`; F043 tracker bookkeeping for dead sessions never released.
-- F040 Claude Code `isMeta`/compact-summary user entries become thread names; F041 Codex injected user items become titles; F046 Droid per-line ids fork instances.
-- F015/F020/F010 full transcript re-read + repeated `list_sessions` per unresolved snapshot every 2 s.
-- F116 `/api/agent-event` trusts client `ts` (seconds instead of ms → pruned in the same request).
-- F044 was decided: `stale` stays an attention-worthy (unseen) state; docs updated.
+Registry over hooks (zero install, exact UI state incl. dialogs and interrupts; hooks stay possible as a push layer — a hook payload's `session_id` + `$TMUX_PANE` maps onto `RegistryInput`/`apply_event` with no remap). Claude Code and Codex in scope; live idle Claude sessions are rows; in-process subagents/workflows never are; teammate processes with their own pane are ordinary rows named after their agent; "delegating" label when busy after the own turn ended; seen = active pane of an attached client; gone rows removed after 10 s whatever the status; `ts` seconds auto-converted; header spinner count unified with the running predicate over visible sessions (F067); `d` on the attached session shows a footer notice (F102); `@opensessions-direct-bindings` opt-out and uninstall restores tmux layout keys (F092); `watch_plan.rs`/`lifecycle_operation.rs` deleted, `portless.rs` kept because `server_state` uses it (F105).
 
-## 4. Redesign direction (proposed, not yet designed)
+## 4. Open items
 
-**Hooks as the primary source for Claude Code; transcript polling as fallback.** A small hook (shell or a subcommand shipped with the binaries) posts `{agent:"claude-code", threadId: session_id, paneId: $TMUX_PANE, tmuxSession: <from tmux display-message -t $TMUX_PANE>, status}` on each event: `UserPromptSubmit` → running, `PreToolUse` → tool-running, `Notification/permission_prompt` → waiting, `Stop` → done, `SessionEnd` → gone; `SubagentStart/Stop` for Task-tool subagents. Then:
+- F046 (Droid per-line ids) is out of scope and still open; Pi/Droid/OpenCode scanners still re-read whole files (small).
+- Registry format is Claude Code-internal. If a future version changes it, `parse_registry_record` returns `None` (unknown status reads as idle, missing `sessionId` skips) and Claude sessions fall back to transcript inference; re-check the vocabulary in the binary (`status:` / `waitingFor` strings) when upgrading.
+- macOS: `ProcessInspector` falls back to `ps -o ppid=` per pid (one spawn per record per tick) and cannot verify `procStart`; if that shows up in profiles, batch it with one `ps -axo pid=,ppid=` per tick.
+- The registry poll costs two tmux spawns per 500 ms (`list-panes -a`, `list-clients`). If it ever matters, throttle the pane listing to the tmux poll cadence and keep only the file reads at 500 ms.
+- `isolated-tmux.sh --stop` then an immediate restart on the same socket races the old opensessions server's shutdown cleanup (it notices the tmux server change ≈4 s later and hides sidebar panes on the new server); wait ~6 s between stop and start.
+- Possible next steps: an opt-in Claude Code hooks layer for sub-poll latency; a "session not ours" indicator for Claude sessions running outside tmux; Codex pane binding beyond the alias heuristic if Codex ever publishes a registry.
 
-- `(agent, threadId)` is the only identity; pane binding is explicit when an integration supplies it and heuristic only as fallback.
-- The watcher path stays for hook-less agents but becomes incremental (per-file byte offsets, parse only appended lines) and uses the hook's `cwd`/`transcript_path` when available instead of decoding folder names.
-- Installation: a `hooks` block in `~/.claude/settings.json`; needs an installer that merges JSON safely and an uninstall path.
-- Everything in `docs/explanation/sidebar-behavior.md` about sidebar width/focus is unaffected; `CONTEXT.md` ("Agent Thread State", "Agent Pane Presence") already states the intended ownership rules.
+## 5. Working rules that matter here
 
-## 5. Product questions the maintainer still has to answer
+- Run `. ~/.cargo/env` first. Build **all bins** before the E2E suite: `cargo build --workspace --bins && cargo test -p opensessions-sidebar --test tmux_e2e`.
+- Never run `tmux` without `-L <private socket>` in experiments; the user's live tmux and the live server on `127.0.0.1:24500` are off limits. To try a build: `cargo build --release && scripts/isolated-tmux.sh`; a headless variant is `tmux -L ostest -f <generated conf> new-session -d -s dev -x 160 -y 40`, `tmux -L ostest run-shell "sh integrations/tmux-plugin/scripts/focus.sh"`, and a python `pty.fork` client with a real window size (a size-less `script` pty makes tmux drop the window).
+- Registry records of your own Claude sessions are readable test data; the `.key` files next to them are secrets — never read them.
+- Debug logging is opt-in: `OPENSESSIONS_DEBUG_LOG=<path>`; the registry path logs `claude-registry applied changes`, the watcher `watcher-snapshot skipped foreign or exited claude session`.
+- Keep `AGENTS.md` rules: registry/watcher/API events author status, panes only bind; sync stays at two tmux calls; transcripts are read incrementally; `SERVER_VERSION` from `package.json`.
 
-Decide these during the design (they were raised by the audit and left open on purpose):
-
-1. Two tmux sessions rooted at the same directory: attribute transcript agents to the session with a live agent pane, show under all, or keep unresolved? (F118)
-2. `/api/agent-event` with `ts` in seconds: auto-convert, reject with 400, or ignore client `ts`? (F116)
-3. Should the header spinner count use the same definition as group badges and the `running` filter? (F067)
-4. `d` on the attached session is a silent no-op — add feedback? (F102)
-5. Make the unconditional `prefix C-s / C-t / M-1..9` bindings opt-in? They shadow tmux's `M-1..M-5` layout keys and tmux-resurrect's `C-s`. (F092)
-6. Delete the orphaned migration modules `watch_plan.rs`, `lifecycle_operation.rs`, `portless.rs`? (F105)
-
-## 6. Working rules that matter here
-
-- Run `. ~/.cargo/env` first (rustup lives in the home dir). Build **all bins** before the E2E suite: `cargo build --workspace --bins && cargo test -p opensessions-sidebar --test tmux_e2e` — the suite runs `target/debug/opensessions-server` and does not rebuild it.
-- Never run `tmux` without `-L <private socket>` in experiments; the user's live tmux (default socket) and the live upstream server on `127.0.0.1:24500` are off limits. `target/debug/opensessions-server` has no CLI flags — it binds a port and blocks; run it in the background with `OPENSESSIONS_PORT`, `OPENSESSIONS_PID_FILE`, `HOME`, `TMUX` pointed at scratch values.
-- tmux ≤ 3.5a on Debian/Ubuntu loses `SIGCHLD` for exiting pane processes (tmux #4559); `nudge_dead_panes` in the poll loop works around it. tmux also expands `$name` inside hook bodies unless escaped — build hook bodies only through `tmux_scripting::run_shell_command`.
-- Keep `AGENTS.md` rules: no pane-derived agent status as a source of truth, sync `MuxProvider` methods, HTTP-first integrations, `SERVER_VERSION` from `package.json`.
-- Debug logging is opt-in: `OPENSESSIONS_DEBUG_LOG=<path>` (capped at 16 MB) — the E2E lab sets it per run, and `scripts/isolated-tmux.sh` logs to `/tmp/opensessions-<socket>-debug.log`.
-- Every push to `main` publishes a release (auto-version → tag → release build). Commit on a branch, land with `git merge --ff-only`, and push when the work is ready to ship; releases are the only way TPM users get binaries.
-
-## 7. Init prompt for the next session
+## 6. Init prompt for the next session
 
 ```
 You are continuing maintenance of the opensessions fork (Xubbbb/opensessions), a Rust tmux sidebar. Start in plan mode; do not write code yet.
 
-First read, in this order: docs/handoff/agent-redesign-handoff.md, docs/handoff/audit-findings.md (only the rows marked "agent redesign"), AGENTS.md, CONTEXT.md, CONTRACTS.md, and the code they point to for the agent pipeline (apps/server-rs/src/lib.rs scan_*/apply_agent_event/sync_agent_pane_presence/prune_agents, packages/runtime-rs/src/tracker.rs, agent_watchers.rs, agent_parsers.rs, project_dir_session.rs, packages/runtime-rs/src/tmux_provider.rs agent_from_pane).
+Read docs/handoff/agent-redesign-handoff.md (registry-first agent identification, implemented 2026-09-13), then docs/handoff/audit-findings.md for what is still open, AGENTS.md and CONTRACTS.md. The agent pipeline lives in packages/runtime-rs/src/{claude_registry,tracker,transcript_tail,agent_watchers,project_dir_session}.rs and apps/server-rs/src/lib.rs (apply_claude_registry, sync_agents, run_agent_watcher_loop).
 
-Goal: redesign and then implement agent identification, focusing on Claude Code first. The handoff proposes hooks-as-primary-source (Claude Code hooks posting to /api/agent-event with session_id + $TMUX_PANE), explicit pane binding, and an incremental transcript fallback.
-
-Before producing a plan, interview me: confirm or challenge the proposed direction, resolve the six open product questions in section 5 of the handoff, and ask about anything the design depends on (which agents besides Claude Code matter to me, how hooks should be installed, what "done"/"waiting"/"unseen" should mean in the sidebar, whether subagents should appear). Then present a design with: the identity model, the event/HTTP contract changes, tracker state machine and pruning rules, the fallback watcher, migration and install steps, and the test plan (unit + tmux E2E). Only after I approve the plan, implement it in small verified steps.
+Ask me what to work on next; candidates are listed in section 4 of the handoff.
 ```
