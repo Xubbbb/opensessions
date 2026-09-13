@@ -1313,10 +1313,34 @@ mod tests {
         let runner = Arc::new(ScriptedRunner::new(HashMap::from([(
             "list-panes",
             [
-                full_pane_row("%1", "work", "@1", true, 4242, "claude", "✳ work", false, true),
-                full_pane_row("%2", "work", "@2", false, 4300, "bash", "shell", true, false),
-                full_pane_row("%3", "work", "@1", false, 4301, "opensessions-sidebar", "opensessions-sidebar", false, true),
-                full_pane_row("%4", "_os_stash", "@9", true, 4302, "bash", "stash", false, true),
+                full_pane_row(
+                    "%1", "work", "@1", true, 4242, "claude", "✳ work", false, true,
+                ),
+                full_pane_row(
+                    "%2", "work", "@2", false, 4300, "bash", "shell", true, false,
+                ),
+                full_pane_row(
+                    "%3",
+                    "work",
+                    "@1",
+                    false,
+                    4301,
+                    "opensessions-sidebar",
+                    "opensessions-sidebar",
+                    false,
+                    true,
+                ),
+                full_pane_row(
+                    "%4",
+                    "_os_stash",
+                    "@9",
+                    true,
+                    4302,
+                    "bash",
+                    "stash",
+                    false,
+                    true,
+                ),
             ]
             .join("\n"),
         )])));
@@ -1390,7 +1414,17 @@ mod tests {
             "list-panes",
             [
                 full_pane_row("%1", "work", "@1", true, 1, "claude", "✳ work", false, true),
-                full_pane_row("%2", "work", "@1", false, 2, "node", "Fix focus - amp - T1", false, true),
+                full_pane_row(
+                    "%2",
+                    "work",
+                    "@1",
+                    false,
+                    2,
+                    "node",
+                    "Fix focus - amp - T1",
+                    false,
+                    true,
+                ),
                 full_pane_row("%3", "docs", "@2", true, 3, "vim", "notes", false, true),
             ]
             .join("\n"),

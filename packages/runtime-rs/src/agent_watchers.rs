@@ -8,6 +8,7 @@ use crate::agent_parsers::{
     determine_amp_message_status, determine_claude_code_status, determine_codex_status,
     determine_opencode_status,
 };
+use crate::claude_registry::claude_code_config_dirs_from;
 use crate::protocol::AgentStatus;
 
 const THREAD_NAME_MAX: usize = 80;
@@ -357,60 +358,17 @@ pub fn codex_thread_id_from_path(path: &str) -> String {
     find_uuid_suffix(name).unwrap_or(name).to_string()
 }
 
-/// Every `projects/` directory Claude Code may write transcripts into.
-///
-/// Claude Code keeps its state under `~/.claude` by default, but users running
-/// several accounts point `CLAUDE_CONFIG_DIR` at another directory (commonly a
-/// sibling such as `~/.claude-work`). The result lists, deduplicated and in
-/// this order: the default, the `CLAUDE_CONFIG_DIR` override, then every
-/// existing `~/.claude*/projects` sibling so accounts still show up when the
-/// server was started from a shell that did not export the variable.
+/// Every `projects/` directory Claude Code may write transcripts into: one
+/// per config directory (see `claude_registry::claude_code_config_dirs`).
 pub fn claude_code_projects_dirs(home: &Path) -> Vec<PathBuf> {
     claude_code_projects_dirs_from(home, std::env::var_os("CLAUDE_CONFIG_DIR").as_deref())
 }
 
 fn claude_code_projects_dirs_from(home: &Path, config_dir: Option<&OsStr>) -> Vec<PathBuf> {
-    let mut dirs = vec![home.join(".claude/projects")];
-    let mut push_unique = |dir: PathBuf| {
-        if !dirs.contains(&dir) {
-            dirs.push(dir);
-        }
-    };
-
-    if let Some(config_dir) = config_dir.filter(|value| !value.is_empty()) {
-        push_unique(expand_home(home, Path::new(config_dir)).join("projects"));
-    }
-
-    let mut siblings = fs::read_dir(home)
+    claude_code_config_dirs_from(home, config_dir)
         .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| name.starts_with(".claude"))
-        })
-        .map(|entry| entry.path().join("projects"))
-        .filter(|projects| projects.is_dir())
-        .collect::<Vec<_>>();
-    siblings.sort();
-    for projects in siblings {
-        push_unique(projects);
-    }
-
-    dirs
-}
-
-fn expand_home(home: &Path, path: &Path) -> PathBuf {
-    match path.to_str() {
-        Some("~") => home.to_path_buf(),
-        Some(text) => match text.strip_prefix("~/") {
-            Some(rest) => home.join(rest),
-            None => path.to_path_buf(),
-        },
-        None => path.to_path_buf(),
-    }
+        .map(|dir| dir.join("projects"))
+        .collect()
 }
 
 pub fn decode_claude_project_dir(encoded: &str, exists: impl Fn(&str) -> bool) -> String {

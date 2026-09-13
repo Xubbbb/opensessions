@@ -3331,15 +3331,24 @@ mod tests {
     #[test]
     fn agent_event_ts_in_seconds_is_scaled_to_milliseconds() {
         let now = 1_789_315_528_128;
-        assert_eq!(normalize_event_ts(Some(1_789_315_528), now), 1_789_315_528_000);
-        assert_eq!(normalize_event_ts(Some(1_789_315_000_000), now), 1_789_315_000_000);
+        assert_eq!(
+            normalize_event_ts(Some(1_789_315_528), now),
+            1_789_315_528_000
+        );
+        assert_eq!(
+            normalize_event_ts(Some(1_789_315_000_000), now),
+            1_789_315_000_000
+        );
         assert_eq!(normalize_event_ts(None, now), now);
     }
 
     #[test]
     fn agent_event_ts_far_in_the_future_is_clamped_to_now() {
         let now = 1_789_315_528_128;
-        assert_eq!(normalize_event_ts(Some(now + 5 * 60 * 1000), now), now + 5 * 60 * 1000);
+        assert_eq!(
+            normalize_event_ts(Some(now + 5 * 60 * 1000), now),
+            now + 5 * 60 * 1000
+        );
         assert_eq!(normalize_event_ts(Some(now + 2 * 60 * 60 * 1000), now), now);
         // A seconds value that is also in the future gets both treatments.
         assert_eq!(normalize_event_ts(Some(now / 1000 + 7200), now), now);

@@ -1,5 +1,6 @@
 pub mod agent_parsers;
 pub mod agent_watchers;
+pub mod claude_registry;
 pub mod config;
 pub mod debug_log;
 pub mod git_info;
