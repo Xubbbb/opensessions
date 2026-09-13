@@ -6,8 +6,9 @@ use crate::mux::{
     ActiveWindow, AgentPane, ClientFocus, MuxProvider, MuxSessionInfo, SidebarPane, SidebarPosition,
 };
 use crate::tmux_scripting::{
-    delayed_http_hook_command, hook_context_format, http_hook_command, pane_died_hook_command,
-    pane_exited_hook_command, sidebar_width_repair_pipeline,
+    delayed_http_hook_command, hook_context_format, hook_slot, http_hook_command,
+    owned_hook_indices, pane_died_hook_command, pane_exited_hook_command,
+    sidebar_width_repair_hook_command,
 };
 
 const SEP: &str = "\t";
@@ -104,6 +105,8 @@ pub struct PaneInfo {
     pub height: u16,
     pub left: u16,
     pub right: u16,
+    /// The pane's process has exited but the pane is kept by `remain-on-exit`.
+    pub dead: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,13 +154,18 @@ impl TmuxClient {
     }
 
     pub fn list_panes(&self, scope: PaneScope<'_>) -> Vec<PaneInfo> {
+        let session_target = match scope {
+            PaneScope::Session(name) => exact_session_window_target(name),
+            _ => String::new(),
+        };
+        let session_target = session_target.as_str();
         let mut args = vec!["list-panes"];
         match scope {
             PaneScope::All => args.push("-a"),
-            PaneScope::Session(target) => {
+            PaneScope::Session(_) => {
                 args.push("-s");
                 args.push("-t");
-                args.push(target);
+                args.push(session_target);
             }
             PaneScope::Window(target) => {
                 args.push("-t");
@@ -175,8 +183,9 @@ impl TmuxClient {
             args.push("-c");
             args.push(client_tty);
         }
+        let target = exact_session_target(target);
         args.push("-t");
-        args.push(target);
+        args.push(&target);
         self.run(&args);
     }
 
@@ -215,7 +224,7 @@ impl TmuxClient {
     }
 
     pub fn kill_session(&self, target: &str) {
-        self.run(&["kill-session", "-t", target]);
+        self.run(&["kill-session", "-t", &exact_session_target(target)]);
     }
 
     pub fn kill_pane(&self, target: &str) {
@@ -248,14 +257,15 @@ impl TmuxClient {
         self.run(&["resize-pane", "-t", target, "-x", &width.to_string()]);
     }
 
+    /// Turn `remain-on-exit` on for a window that hosts a sidebar, or release
+    /// it again. Releasing unsets the window-level value rather than forcing
+    /// `off`, so a user's own global `remain-on-exit on` is not overridden.
     pub fn set_window_remain_on_exit(&self, target: &str, enabled: bool) {
-        self.run(&[
-            "set-window-option",
-            "-t",
-            target,
-            "remain-on-exit",
-            if enabled { "on" } else { "off" },
-        ]);
+        if enabled {
+            self.run(&["set-window-option", "-t", target, "remain-on-exit", "on"]);
+        } else {
+            self.run(&["set-window-option", "-u", "-t", target, "remain-on-exit"]);
+        }
     }
 
     pub fn set_remain_on_exit_for_sidebar_windows(&self, enabled: bool) {
@@ -272,23 +282,24 @@ impl TmuxClient {
         target: &str,
         before: bool,
         width: u16,
+        env: &[(&str, &str)],
         command: &str,
     ) -> Option<PaneInfo> {
         let size = width.to_string();
         let side = if before { "-hb" } else { "-h" };
-        let output = self.run(&[
-            "split-window",
-            side,
-            "-f",
-            "-l",
-            &size,
-            "-t",
-            target,
-            "-P",
-            "-F",
-            pane_format(),
-            command,
-        ]);
+        let mut args = vec!["split-window", side, "-f", "-l", &size];
+        // `-e` hands the pane its environment directly, so per-pane values
+        // never pass through the user's shell (tmux >= 3.0).
+        let env_args = env
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>();
+        for assignment in &env_args {
+            args.push("-e");
+            args.push(assignment);
+        }
+        args.extend(["-t", target, "-P", "-F", pane_format(), command]);
+        let output = self.run(&args);
         if !output.ok() || output.stdout.is_empty() {
             return None;
         }
@@ -360,7 +371,10 @@ impl TmuxClient {
     }
 
     pub fn get_session_dir(&self, target: &str) -> String {
-        self.display("#{pane_current_path}", Some(target))
+        self.display(
+            "#{pane_current_path}",
+            Some(&exact_session_window_target(target)),
+        )
     }
 
     pub fn get_pane_count(&self, target: &str) -> u32 {
@@ -395,18 +409,38 @@ impl TmuxClient {
         dirs
     }
 
+    /// Install `command` as opensessions' entry for `name`, in its own array
+    /// slot so hooks other plugins registered on the same event survive.
     pub fn set_global_hook(&self, name: &str, command: &str) {
-        let output = self.run(&["set-hook", "-g", name, command]);
+        self.remove_owned_hook_entries(name);
+        let slot = hook_slot(name);
+        let output = self.run(&["set-hook", "-g", &slot, command]);
         if !output.ok() {
             eprintln!(
-                "opensessions: failed to install tmux hook {name}: status={} stderr={} command={command}",
+                "opensessions: failed to install tmux hook {slot}: status={} stderr={} command={command}",
                 output.exit_code, output.stderr,
             );
         }
     }
 
     pub fn unset_global_hook(&self, name: &str) {
-        self.run(&["set-hook", "-gu", name]);
+        self.remove_owned_hook_entries(name);
+        self.run(&["set-hook", "-gu", &hook_slot(name)]);
+    }
+
+    /// Remove every entry of `name` that opensessions wrote, in whatever slot.
+    /// Releases before hooks moved to a fixed slot replaced the whole array,
+    /// so their entry sits at index 0; leaving it behind after an upgrade
+    /// would keep a hook pointing at a dead server port. Other plugins'
+    /// entries are untouched.
+    fn remove_owned_hook_entries(&self, name: &str) {
+        let listing = self.run(&["show-hooks", "-g", name]);
+        if !listing.ok() {
+            return;
+        }
+        for index in owned_hook_indices(name, &listing.stdout) {
+            self.run(&["set-hook", "-gu", &format!("{name}[{index}]")]);
+        }
     }
 
     pub fn set_global_option(&self, name: &str, value: &str) {
@@ -511,8 +545,7 @@ impl MuxProvider for TmuxProvider {
         let ensure_cmd = http_hook_command(&base, "/ensure-sidebar", Some(hook_context), true);
         let pane_exited_cmd = pane_exited_hook_command(&base);
         let pane_died_cmd = pane_died_hook_command(&base);
-        let repair_sidebar_width_cmd =
-            format!("run-shell -b \"{}\"", sidebar_width_repair_pipeline());
+        let repair_sidebar_width_cmd = sidebar_width_repair_hook_command();
         let client_resized_cmd = format!(
             "{repair_sidebar_width_cmd} ; {}",
             delayed_http_hook_command(&base, "/client-resized"),
@@ -668,6 +701,12 @@ impl MuxProvider for TmuxProvider {
     }
 
     fn hide_sidebar(&self, pane_id: &str) {
+        // The window only needed remain-on-exit while it hosted a sidebar;
+        // release it first so a later shell exit closes the pane normally.
+        let window_id = self.client.display("#{window_id}", Some(pane_id));
+        if !window_id.is_empty() {
+            self.client.set_window_remain_on_exit(&window_id, false);
+        }
         self.client.kill_pane(pane_id);
     }
 
@@ -816,18 +855,17 @@ impl MuxProvider for TmuxProvider {
             SidebarPosition::Left => panes.iter().min_by_key(|pane| pane.left),
             SidebarPosition::Right => panes.iter().max_by_key(|pane| pane.right),
         }?;
-        // Resolve the script path against `$OPENSESSIONS_DIR` so the spawned
-        // pane works even when the parent pane's cwd is unrelated to the
-        // workspace (e.g. tmux sessions whose default cwd is `$HOME`). Falls
-        // back to the literal path if the env is unset.
-        let command = format!(
-            "OPENSESSIONS_SESSION_NAME={} OPENSESSIONS_WINDOW_ID={window_id} REFOCUS_WINDOW={window_id} exec \"${{OPENSESSIONS_DIR:-.}}\"/{scripts_dir}/start.sh",
-            target.session_name,
-        );
+        let command = sidebar_launch_command(scripts_dir);
+        let env = [
+            ("OPENSESSIONS_SESSION_NAME", target.session_name.as_str()),
+            ("OPENSESSIONS_WINDOW_ID", window_id),
+            ("REFOCUS_WINDOW", window_id),
+        ];
         let new_pane = self.client.split_sidebar_pane(
             &target.id,
             position == SidebarPosition::Left,
             width,
+            &env,
             &command,
         )?;
         self.client
@@ -839,6 +877,56 @@ impl MuxProvider for TmuxProvider {
     fn get_all_pane_counts(&self) -> HashMap<String, u32> {
         self.client.get_all_pane_counts()
     }
+
+    fn mux_server_id(&self) -> Option<String> {
+        let output = self.client.run(&["display-message", "-p", "#{pid}"]);
+        let pid = output.stdout.trim();
+        (output.ok() && !pid.is_empty()).then(|| pid.to_string())
+    }
+
+    fn resolve_session_id(&self, id: &str) -> Option<String> {
+        self.client
+            .list_sessions()
+            .into_iter()
+            .find(|session| session.id == id)
+            .map(|session| session.name)
+    }
+
+    fn nudge_dead_panes(&self) -> bool {
+        if !self
+            .client
+            .list_panes(PaneScope::All)
+            .iter()
+            .any(|pane| pane.dead)
+        {
+            return false;
+        }
+        // tmux <= 3.5a built with utempter can lose the SIGCHLD of an exiting
+        // pane process (tmux issue #4559): the pane shows as dead, but tmux
+        // never reaps the child, so `pane-died` (and our cleanup hook) never
+        // fires. Spawning any trivial job hands tmux a fresh SIGCHLD; its
+        // reaper then collects the zombie and the notification goes out.
+        self.client.run(&["run-shell", "-b", "true"]);
+        true
+    }
+}
+
+/// Build the pane command that launches the sidebar.
+///
+/// tmux runs pane commands through the user's `default-shell`, which may be a
+/// non-POSIX shell such as fish that cannot parse `${VAR:-default}` or
+/// `NAME=value cmd` prefixes. The user's shell therefore only ever sees the
+/// fixed string `sh -c '...'`; the POSIX expansion runs inside `sh`. The path
+/// is resolved against `$OPENSESSIONS_DIR` (exported into tmux's global
+/// environment by `opensessions.tmux`) so the pane works even when the parent
+/// pane's cwd is unrelated to the plugin checkout. Per-pane values such as the
+/// session name are passed with `split-window -e`, never through a shell.
+fn sidebar_launch_command(scripts_dir: &str) -> String {
+    debug_assert!(
+        !scripts_dir.contains('\''),
+        "scripts_dir must not contain single quotes"
+    );
+    format!("sh -c 'exec \"${{OPENSESSIONS_DIR:-.}}\"/{scripts_dir}/start.sh'")
 }
 
 fn session_format() -> &'static str {
@@ -854,7 +942,21 @@ fn client_format() -> &'static str {
 }
 
 fn pane_format() -> &'static str {
-    "#{pane_id}\t#{session_name}\t#{window_id}\t#{window_index}\t#{pane_index}\t#{pane_active}\t#{pane_tty}\t#{pane_pid}\t#{pane_current_path}\t#{pane_current_command}\t#{pane_title}\t#{pane_width}\t#{pane_height}\t#{pane_left}\t#{pane_right}"
+    "#{pane_id}\t#{session_name}\t#{window_id}\t#{window_index}\t#{pane_index}\t#{pane_active}\t#{pane_tty}\t#{pane_pid}\t#{pane_current_path}\t#{pane_current_command}\t#{pane_title}\t#{pane_width}\t#{pane_height}\t#{pane_left}\t#{pane_right}\t#{pane_dead}"
+}
+
+/// tmux resolves a bare `-t <name>` on window/pane commands (`list-panes -s`,
+/// `display-message`, ...) as a window of the *current* session first, so a
+/// session called `1` or `api` can silently target another session's panes.
+/// `=name:` forces an exact session match with its active window.
+fn exact_session_window_target(name: &str) -> String {
+    format!("={name}:")
+}
+
+/// Exact session match for session-target commands (`switch-client`,
+/// `kill-session`), which otherwise accept prefix and glob matches.
+fn exact_session_target(name: &str) -> String {
+    format!("={name}")
 }
 
 fn agent_from_pane(pane: &PaneInfo) -> Option<String> {
@@ -863,9 +965,15 @@ fn agent_from_pane(pane: &PaneInfo) -> Option<String> {
     if title == "pi" || title.starts_with("pi ") || title.starts_with('π') || command == "pi" {
         return Some("pi".to_string());
     }
-    let haystack = format!("{title} {command}");
+    // Match whole words only: a substring match let `amp` claim any pane whose
+    // title contained "example" and `claude` claim "claude-docs".
+    let tokens = format!("{title} {command}")
+        .split(|ch: char| !(ch.is_alphanumeric() || ch == '-' || ch == '_'))
+        .filter(|token| !token.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
     for (agent, aliases) in AGENT_ALIASES {
-        if aliases.iter().any(|alias| haystack.contains(alias)) {
+        if tokens.iter().any(|token| aliases.contains(&token.as_str())) {
             return Some((*agent).to_string());
         }
     }
@@ -987,6 +1095,7 @@ fn parse_panes(raw: &str) -> Vec<PaneInfo> {
                 height: parse_u16(&parts, 12),
                 left: parse_u16(&parts, 13),
                 right: parse_u16(&parts, 14),
+                dead: part(&parts, 15) == "1",
             })
         })
         .collect()
@@ -1040,6 +1149,227 @@ mod tests {
                 stderr: String::new(),
             }
         }
+    }
+
+    /// Runner that answers each tmux subcommand with a canned stdout.
+    struct ScriptedRunner {
+        calls: Mutex<Vec<Vec<String>>>,
+        replies: HashMap<&'static str, String>,
+    }
+
+    impl ScriptedRunner {
+        fn new(replies: HashMap<&'static str, String>) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                replies,
+            }
+        }
+
+        fn call(&self, subcommand: &str) -> Vec<String> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|call| call.first().map(String::as_str) == Some(subcommand))
+                .cloned()
+                .unwrap_or_else(|| panic!("expected a `{subcommand}` call"))
+        }
+    }
+
+    impl CommandRunner for ScriptedRunner {
+        fn run(&self, args: &[String]) -> CommandOutput {
+            self.calls.lock().unwrap().push(args.to_vec());
+            let stdout = args
+                .first()
+                .and_then(|subcommand| self.replies.get(subcommand.as_str()))
+                .cloned()
+                .unwrap_or_default();
+            CommandOutput {
+                exit_code: 0,
+                stdout,
+                stderr: String::new(),
+            }
+        }
+    }
+
+    fn pane_row(id: &str, session: &str, title: &str, left: u16, right: u16) -> String {
+        format!(
+            "{id}\t{session}\t@1\t0\t0\t1\t/dev/ttys1\t123\t/repo\tbash\t{title}\t80\t24\t{left}\t{right}"
+        )
+    }
+
+    #[test]
+    fn spawn_sidebar_passes_pane_values_via_env_flags_not_the_shell() {
+        // A session name full of shell metacharacters must reach the pane
+        // untouched, and the command handed to the user's (possibly non-POSIX)
+        // shell must be the fixed `sh -c` launcher with nothing interpolated.
+        let evil = r#"x"; touch /tmp/pwned; $(id)`whoami` o'brien"#;
+        let runner = Arc::new(ScriptedRunner::new(HashMap::from([
+            ("list-panes", pane_row("%1", evil, "main", 0, 79)),
+            (
+                "split-window",
+                pane_row("%9", evil, "opensessions-sidebar", 0, 25),
+            ),
+        ])));
+        let provider = TmuxProvider::new(runner.clone());
+
+        let pane = provider.spawn_sidebar(
+            "ignored",
+            "@1",
+            26,
+            SidebarPosition::Left,
+            "apps/tui/scripts",
+        );
+
+        assert_eq!(pane.as_deref(), Some("%9"));
+        let split = runner.call("split-window");
+        assert_eq!(
+            split,
+            vec![
+                "split-window",
+                "-hb",
+                "-f",
+                "-l",
+                "26",
+                "-e",
+                &format!("OPENSESSIONS_SESSION_NAME={evil}"),
+                "-e",
+                "OPENSESSIONS_WINDOW_ID=@1",
+                "-e",
+                "REFOCUS_WINDOW=@1",
+                "-t",
+                "%1",
+                "-P",
+                "-F",
+                pane_format(),
+                r#"sh -c 'exec "${OPENSESSIONS_DIR:-.}"/apps/tui/scripts/start.sh'"#,
+            ]
+        );
+        assert_eq!(
+            runner.call("select-pane"),
+            vec!["select-pane", "-t", "%9", "-T", "opensessions-sidebar"]
+        );
+    }
+
+    #[test]
+    fn spawn_sidebar_splits_to_the_right_of_the_rightmost_pane_when_positioned_right() {
+        let runner = Arc::new(ScriptedRunner::new(HashMap::from([
+            (
+                "list-panes",
+                format!(
+                    "{}\n{}",
+                    pane_row("%1", "alpha", "main", 0, 39),
+                    pane_row("%2", "alpha", "main", 40, 79)
+                ),
+            ),
+            (
+                "split-window",
+                pane_row("%9", "alpha", "opensessions-sidebar", 54, 79),
+            ),
+        ])));
+        let provider = TmuxProvider::new(runner.clone());
+
+        provider.spawn_sidebar(
+            "alpha",
+            "@1",
+            26,
+            SidebarPosition::Right,
+            "apps/tui/scripts",
+        );
+
+        let split = runner.call("split-window");
+        assert_eq!(split[1], "-h");
+        assert_eq!(
+            split[split.iter().position(|arg| arg == "-t").unwrap() + 1],
+            "%2"
+        );
+    }
+
+    #[test]
+    fn hooks_are_installed_in_their_own_slot_and_legacy_entries_are_cleared() {
+        let ours = "run-shell -b \"curl -s -o /dev/null -m 0.2 --connect-timeout 0.1 -X POST http://127.0.0.1:24500/refresh >/dev/null 2>&1 || true\"";
+        let listing = format!(
+            "session-created[0] {ours}\nsession-created[7] run-shell \"~/.tmux/plugins/other/save.sh\"\n"
+        );
+        let runner = Arc::new(ScriptedRunner::new(HashMap::from([(
+            "show-hooks",
+            listing,
+        )])));
+        let client = TmuxClient::new(runner.clone());
+
+        client.set_global_hook("session-created", ours);
+        client.unset_global_hook("session-created");
+
+        let calls = runner.calls.lock().unwrap().clone();
+        let slot = format!("session-created[{}]", crate::tmux_scripting::HOOK_SLOT);
+        assert_eq!(
+            calls,
+            vec![
+                vec!["show-hooks", "-g", "session-created"],
+                vec!["set-hook", "-gu", "session-created[0]"],
+                vec!["set-hook", "-g", slot.as_str(), ours],
+                vec!["show-hooks", "-g", "session-created"],
+                vec!["set-hook", "-gu", "session-created[0]"],
+                vec!["set-hook", "-gu", slot.as_str()],
+            ]
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call == &vec!["set-hook", "-gu", "session-created"]
+                    || call == &vec!["set-hook", "-gu", "session-created[7]"]),
+            "must never wipe the whole array or another plugin's slot"
+        );
+    }
+
+    #[test]
+    fn session_scoped_commands_use_exact_session_targets() {
+        let runner = Arc::new(ScriptedRunner::new(HashMap::new()));
+        let client = TmuxClient::new(runner.clone());
+
+        client.list_panes(PaneScope::Session("1"));
+        client.get_session_dir("api");
+        client.switch_client("api", None);
+        client.kill_session("api");
+
+        let calls = runner.calls.lock().unwrap().clone();
+        assert_eq!(calls[0][..4], ["list-panes", "-s", "-t", "=1:"]);
+        assert_eq!(calls[1][..3], ["display-message", "-t", "=api:"]);
+        assert_eq!(calls[2], vec!["switch-client", "-t", "=api"]);
+        assert_eq!(calls[3], vec!["kill-session", "-t", "=api"]);
+    }
+
+    #[test]
+    fn agent_detection_matches_whole_words_only() {
+        let pane = |title: &str, command: &str| PaneInfo {
+            id: "%1".into(),
+            session_name: "s".into(),
+            window_id: "@1".into(),
+            window_index: 0,
+            index: 0,
+            active: false,
+            tty: String::new(),
+            pid: 0,
+            cwd: String::new(),
+            command: command.into(),
+            title: title.into(),
+            width: 80,
+            height: 24,
+            left: 0,
+            right: 79,
+            dead: false,
+        };
+        assert_eq!(
+            agent_from_pane(&pane("host", "claude")).as_deref(),
+            Some("claude-code")
+        );
+        assert_eq!(
+            agent_from_pane(&pane("Fix focus - amp - T1", "node")).as_deref(),
+            Some("amp")
+        );
+        assert_eq!(agent_from_pane(&pane("example", "bash")), None);
+        assert_eq!(agent_from_pane(&pane("claude-docs", "bash")), None);
+        assert_eq!(agent_from_pane(&pane("sample notes", "vim")), None);
     }
 
     #[test]

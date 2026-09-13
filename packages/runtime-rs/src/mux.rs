@@ -150,6 +150,24 @@ pub trait MuxProvider: Send + Sync {
     fn get_all_pane_counts(&self) -> HashMap<String, u32> {
         HashMap::new()
     }
+
+    /// Identity of the running mux server instance (tmux: its pid). `None`
+    /// when the mux is not reachable. Lets the server notice when the mux it
+    /// hooked into has exited or been replaced on the same socket.
+    fn mux_server_id(&self) -> Option<String> {
+        None
+    }
+
+    /// Map a mux-native session id (tmux `$N`) back to the session name.
+    fn resolve_session_id(&self, _id: &str) -> Option<String> {
+        None
+    }
+
+    /// Work around lost pane-exit notifications in the mux, if it has any
+    /// dead panes waiting to be reaped. Returns whether a nudge was sent.
+    fn nudge_dead_panes(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Default)]
