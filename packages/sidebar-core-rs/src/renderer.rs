@@ -2864,6 +2864,7 @@ mod tests {
             unseen: None,
             pane_id: None,
             liveness: None,
+            detail: None,
         }
     }
 

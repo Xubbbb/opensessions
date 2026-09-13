@@ -168,6 +168,11 @@ pub struct AgentEvent {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub liveness: Option<AgentLiveness>,
+    /// Short human-readable qualifier of `status` ("delegating",
+    /// "dialog open", "shell running"), shown next to the status label.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]

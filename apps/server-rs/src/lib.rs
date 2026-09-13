@@ -18,6 +18,10 @@ use opensessions_runtime::agent_watchers::{
     decode_claude_project_dir, droid_snapshot_from_jsonl, opencode_snapshot_from_row,
     parse_codex_session_index, pi_snapshot_from_jsonl,
 };
+use opensessions_runtime::claude_registry::{
+    CLAUDE_CODE_AGENT, RegistryResolver, ResolvedRecord, SystemProcessInspector,
+    claude_code_config_dirs, scan_registry,
+};
 use opensessions_runtime::config::{
     OpensessionsConfig, SidebarPosition as ConfigSidebarPosition, load_config_from_home,
     save_config_to_home,
@@ -25,7 +29,7 @@ use opensessions_runtime::config::{
 use opensessions_runtime::debug_log::log_with_tag;
 use opensessions_runtime::git_info::{GitInfo, parse_git_info_output};
 use opensessions_runtime::metadata_store::SessionMetadataStore;
-use opensessions_runtime::mux::{ActiveWindow, MuxProvider, SidebarPosition};
+use opensessions_runtime::mux::{ActiveWindow, ClientFocus, MuxPane, MuxProvider, SidebarPosition};
 use opensessions_runtime::pi_runtime_registry::{PiRuntimeRegistry, parse_pi_runtime_info};
 use opensessions_runtime::port_discovery::{PortDiscoveryInput, discover_session_ports};
 use opensessions_runtime::project_dir_session::{
@@ -40,7 +44,7 @@ use opensessions_runtime::session_order::SessionOrder;
 use opensessions_runtime::sidebar_coordinator::SidebarCoordinator;
 use opensessions_runtime::sidebar_width_sync::clamp_sidebar_width;
 use opensessions_runtime::tmux_provider::{StdCommandRunner, TmuxProvider};
-use opensessions_runtime::tracker::{AgentTracker, PanePresenceInput, STUCK_PRUNE_MS};
+use opensessions_runtime::tracker::{AgentTracker, RegistryInput, Source};
 use opensessions_sidebar_core::app::App as SidebarApp;
 use opensessions_sidebar_core::generated::protocol::ServerMessage as SidebarServerMessage;
 use serde_json::Value;
@@ -77,7 +81,11 @@ const SIDEBAR_SCRIPTS_DIR: &str = "apps/tui/scripts";
 const GIT_CACHE_TTL_MS: u64 = 5_000;
 const PORT_POLL_INTERVAL_MS: u64 = 10_000;
 const RENDERED_SIDEBAR_FRAME_MS: u64 = 16;
-const AGENT_WATCHER_POLL_MS: u64 = 2_000;
+/// Registry records are a handful of tiny files: poll them often so status
+/// changes reach the sidebar within half a second.
+const AGENT_REGISTRY_POLL_MS: u64 = 500;
+/// Transcripts are scanned every Nth registry tick (2 s).
+const AGENT_TRANSCRIPT_TICK_EVERY: u32 = 4;
 const TMUX_STATE_POLL_MS: u64 = 2_000;
 /// Consecutive poll ticks the mux may be unreachable/replaced before the
 /// server treats its tmux server as gone and exits.
@@ -368,14 +376,17 @@ pub struct ReadOnlyMuxStateSource {
     detail_panel_height: Mutex<u16>,
     agent_panel_scope: Mutex<AgentPanelScope>,
     focused_session: Mutex<Option<String>>,
-    focused_pane_by_session: Mutex<HashMap<String, String>>,
-    focused_client_tty: Mutex<Option<String>>,
     theme: Mutex<Option<String>>,
     session_filter: Mutex<Option<SessionFilterMode>>,
     collapsed_worktree_groups: Mutex<HashSet<String>>,
     session_order: Mutex<SessionOrder>,
     metadata_store: Mutex<SessionMetadataStore>,
     agent_tracker: Mutex<AgentTracker>,
+    registry_resolver: Mutex<RegistryResolver>,
+    /// Claude Code session ids whose registry record says they run outside
+    /// this mux (another tmux server, or no tmux at all): the transcript
+    /// watcher must not attribute them to one of our sessions by directory.
+    foreign_claude_sessions: Mutex<HashSet<String>>,
     pi_runtime_registry: Mutex<PiRuntimeRegistry>,
     now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
@@ -437,14 +448,14 @@ impl ReadOnlyMuxStateSource {
             detail_panel_height: Mutex::new(DEFAULT_DETAIL_PANEL_HEIGHT),
             agent_panel_scope: Mutex::new(AgentPanelScope::Current),
             focused_session: Mutex::new(None),
-            focused_pane_by_session: Mutex::new(HashMap::new()),
-            focused_client_tty: Mutex::new(None),
             theme: Mutex::new(None),
             session_filter: Mutex::new(None),
             collapsed_worktree_groups: Mutex::new(HashSet::new()),
             session_order: Mutex::new(SessionOrder::new(None)),
             metadata_store: Mutex::new(SessionMetadataStore::new()),
             agent_tracker: Mutex::new(AgentTracker::new()),
+            registry_resolver: Mutex::new(RegistryResolver::new()),
+            foreign_claude_sessions: Mutex::new(HashSet::new()),
             pi_runtime_registry: Mutex::new(PiRuntimeRegistry::with_default_ttl()),
             now_ms: Arc::new(current_time_ms),
         }
@@ -557,73 +568,96 @@ impl ReadOnlyMuxStateSource {
         self
     }
 
-    fn sync_agent_pane_presence(&self) -> bool {
-        let mut presence_by_session = Vec::new();
-        let mut focused_agent_panes = HashMap::<String, String>::new();
-        let focused_client_tty = self.focused_client_tty.lock().unwrap().clone();
+    /// One listing pass over the mux, shared by agent sync and the registry
+    /// poll: every content pane and every attached client's current pane.
+    fn observe_mux(&self) -> (Vec<MuxPane>, Vec<ClientFocus>) {
+        let mut panes = Vec::new();
+        let mut focus = Vec::new();
         for provider in &self.providers {
-            let client_focus = provider.get_client_focus(focused_client_tty.as_deref());
-            for session in provider.list_sessions() {
-                let pane_agents = provider
-                    .list_agent_panes(&session.name)
-                    .into_iter()
-                    .map(|pane| {
-                        if client_focus.as_ref().is_some_and(|focus| {
-                            focus.session_name == session.name && focus.pane_id == pane.pane_id
-                        }) {
-                            focused_agent_panes.insert(session.name.clone(), pane.pane_id.clone());
-                        }
-                        PanePresenceInput {
-                            agent: pane.agent,
-                            pane_id: pane.pane_id,
-                            active: pane.active,
-                            thread_id: pane.thread_id,
-                            thread_name: pane.thread_name,
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                if !pane_agents.is_empty() {
-                    debug_log(format!(
-                        "agent-pane-presence session={} panes={:?}",
-                        session.name, pane_agents,
-                    ));
-                }
-                presence_by_session.push((session.name, pane_agents));
-            }
+            panes.extend(provider.list_all_panes());
+            focus.extend(provider.list_client_focus());
         }
-
-        let mut changed = false;
-        let mut tracker = self.agent_tracker.lock().unwrap();
-        for (session, pane_agents) in presence_by_session {
-            changed = tracker.apply_pane_presence(&session, pane_agents) || changed;
-        }
-        for (session, pane_id) in focused_agent_panes {
-            let previous = self
-                .focused_pane_by_session
-                .lock()
-                .unwrap()
-                .insert(session.clone(), pane_id.clone());
-            let seen_changed = tracker.mark_pane_seen(&session, &pane_id);
-            debug_log(format!(
-                "current-agent-pane-seen session={session} pane={pane_id} previous={previous:?} changed={seen_changed}",
-            ));
-            changed = seen_changed || changed;
-        }
-        changed
+        (panes, focus)
     }
 
-    /// Reap finished agents whose pane is gone or that have aged past their
-    /// TTL, so closed agents drop out of the sidebar without a server restart.
-    fn prune_agents(&self) -> bool {
+    /// Reconcile agent rows with the mux (pane liveness, pane binding, the
+    /// seen rule) and reap rows that are gone or abandoned.
+    fn sync_agents(&self) -> bool {
+        let (panes, focus) = self.observe_mux();
+        self.sync_agents_with(&panes, &focus)
+    }
+
+    fn sync_agents_with(&self, panes: &[MuxPane], focus: &[ClientFocus]) -> bool {
         let now = (self.now_ms)();
         let mut tracker = self.agent_tracker.lock().unwrap();
-        let pruned_terminal = tracker.prune_terminal(now);
-        let pruned_stuck = tracker.prune_stuck(now, STUCK_PRUNE_MS);
-        let changed = pruned_terminal || pruned_stuck;
+        let mut changed = false;
+        // An empty listing means the mux did not answer (or has nothing
+        // left); treat it as unknown rather than declaring every pane gone.
+        if !panes.is_empty() {
+            let live_sessions = panes
+                .iter()
+                .map(|pane| pane.session_name.clone())
+                .collect::<HashSet<_>>();
+            changed = tracker.sync_panes(panes, focus, &live_sessions, now);
+        }
+        let pruned = tracker.prune(now);
+        drop(tracker);
+        self.pi_runtime_registry.lock().unwrap().prune(now);
+        if pruned {
+            debug_log("prune-agents reaped rows");
+        }
+        changed || pruned
+    }
+
+    /// Fold this tick's Claude Code registry records into the tracker.
+    /// Returns whether any row changed.
+    fn apply_claude_registry(&self, panes: &[MuxPane], home: Option<&Path>) -> bool {
+        let Some(home) = home else {
+            return false;
+        };
+        let records = scan_registry(&claude_code_config_dirs(home));
+        let resolved =
+            self.registry_resolver
+                .lock()
+                .unwrap()
+                .resolve(records, panes, &SystemProcessInspector);
+        let mut inputs = Vec::new();
+        let mut foreign = HashSet::new();
+        for ResolvedRecord {
+            record,
+            liveness,
+            pane,
+        } in resolved
+        {
+            if liveness != opensessions_runtime::claude_registry::RecordLiveness::Alive {
+                continue;
+            }
+            let Some(pane) = pane else {
+                foreign.insert(record.session_id);
+                continue;
+            };
+            inputs.push(RegistryInput {
+                thread_id: record.session_id,
+                session: pane.session_name,
+                pane_id: pane.pane_id,
+                pid: record.pid,
+                status: record.status,
+                waiting_for: record.waiting_for,
+                status_updated_at: record.status_updated_at,
+                started_at: record.started_at,
+                name: record.name,
+                agent_name: record.agent,
+            });
+        }
+        *self.foreign_claude_sessions.lock().unwrap() = foreign;
+        let now = (self.now_ms)();
+        let changed = self
+            .agent_tracker
+            .lock()
+            .unwrap()
+            .apply_registry(inputs, now);
         if changed {
-            debug_log(format!(
-                "prune-agents terminal={pruned_terminal} stuck={pruned_stuck}"
-            ));
+            debug_log("claude-registry applied changes");
         }
         changed
     }
@@ -641,24 +675,10 @@ impl ReadOnlyMuxStateSource {
         Some(context)
     }
 
-    fn mark_focused_agent_panes_seen(&self) -> bool {
-        let focused = self.focused_pane_by_session.lock().unwrap().clone();
-        if focused.is_empty() {
-            return false;
-        }
-        let mut tracker = self.agent_tracker.lock().unwrap();
-        let mut changed = false;
-        for (session, pane_id) in focused {
-            let pane_changed = tracker.mark_pane_seen(&session, &pane_id);
-            debug_log(format!(
-                "focused-pane-seen-check session={session} pane={pane_id} changed={pane_changed}",
-            ));
-            changed = pane_changed || changed;
-        }
-        changed
-    }
-
-    fn remember_focused_pane(&self, context: &HttpContext) -> bool {
+    /// A tmux focus hook fired: the reported pane is what the user is
+    /// looking at, so agents bound to it are seen. Nothing is remembered;
+    /// later syncs ask tmux again.
+    fn mark_focused_pane_seen(&self, context: &HttpContext) -> bool {
         if context.pane_active == Some(false) {
             debug_log(format!(
                 "focus-pane ignored inactive session={} pane={:?}",
@@ -673,13 +693,6 @@ impl ReadOnlyMuxStateSource {
         else {
             return false;
         };
-        if context.client_tty.is_some() {
-            *self.focused_client_tty.lock().unwrap() = context.client_tty.clone();
-        }
-        self.focused_pane_by_session
-            .lock()
-            .unwrap()
-            .insert(context.session.clone(), pane_id.to_string());
         let changed = self
             .agent_tracker
             .lock()
@@ -737,9 +750,7 @@ impl StateSource for ReadOnlyMuxStateSource {
     }
 
     fn snapshot_json(&self) -> String {
-        self.sync_agent_pane_presence();
-        self.mark_focused_agent_panes_seen();
-        self.prune_agents();
+        self.sync_agents();
 
         let providers = self
             .providers
@@ -1188,7 +1199,7 @@ impl StateSource for ReadOnlyMuxStateSource {
         let context = self.parse_hook_context(body)?;
         let name = context.session.clone();
         *self.focused_session.lock().unwrap() = Some(name.clone());
-        if self.remember_focused_pane(&context) {
+        if self.mark_focused_pane_seen(&context) {
             return Some(self.snapshot_json());
         }
         None
@@ -1267,8 +1278,6 @@ impl ReadOnlyMuxStateSource {
             .get("paneId")
             .and_then(Value::as_str)
             .map(ToString::to_string);
-        let event_pane_id = pane_id.clone();
-        let event_session = session.clone();
         self.agent_tracker.lock().unwrap().apply_event(AgentEvent {
             agent,
             session,
@@ -1290,24 +1299,8 @@ impl ReadOnlyMuxStateSource {
             unseen: None,
             liveness: pane_id.as_ref().map(|_| AgentLiveness::Alive),
             pane_id,
+            detail: None,
         });
-        if let Some(pane_id) = event_pane_id
-            && self
-                .focused_pane_by_session
-                .lock()
-                .unwrap()
-                .get(&event_session)
-                .is_some_and(|focused_pane| focused_pane == &pane_id)
-        {
-            debug_log(format!(
-                "agent-event-focused-pane session={} pane={} -> mark seen",
-                event_session, pane_id,
-            ));
-            self.agent_tracker
-                .lock()
-                .unwrap()
-                .mark_pane_seen(&event_session, &pane_id);
-        }
         Ok(())
     }
 
@@ -1316,6 +1309,20 @@ impl ReadOnlyMuxStateSource {
             debug_log(format!(
                 "watcher-snapshot ignored idle agent={} thread_id={:?} thread_name={:?} project_dir={:?}",
                 snapshot.agent, snapshot.thread_id, snapshot.thread_name, snapshot.project_dir,
+            ));
+            return false;
+        }
+        if snapshot.agent == CLAUDE_CODE_AGENT
+            && snapshot.thread_id.as_ref().is_some_and(|thread_id| {
+                self.foreign_claude_sessions
+                    .lock()
+                    .unwrap()
+                    .contains(thread_id)
+            })
+        {
+            debug_log(format!(
+                "watcher-snapshot skipped foreign claude session thread_id={:?}",
+                snapshot.thread_id,
             ));
             return false;
         }
@@ -1330,16 +1337,9 @@ impl ReadOnlyMuxStateSource {
             ));
             return false;
         };
-        let focused_pane = self
-            .focused_pane_by_session
-            .lock()
-            .unwrap()
-            .get(&session)
-            .cloned();
         debug_log(format!(
-            "watcher-snapshot applying session={} focused_pane={:?} agent={} status={:?} thread_id={:?} thread_name={:?} project_dir={:?}",
+            "watcher-snapshot applying session={} agent={} status={:?} thread_id={:?} thread_name={:?} project_dir={:?}",
             session,
-            focused_pane,
             snapshot.agent,
             snapshot.status,
             snapshot.thread_id,
@@ -1357,20 +1357,12 @@ impl ReadOnlyMuxStateSource {
             unseen: None,
             pane_id: None,
             liveness: None,
+            detail: None,
         };
-        self.agent_tracker.lock().unwrap().apply_event(event);
-        if let Some(pane_id) = focused_pane {
-            let changed = self
-                .agent_tracker
-                .lock()
-                .unwrap()
-                .mark_pane_seen(&session, &pane_id);
-            debug_log(format!(
-                "watcher-snapshot-focused-pane-seen session={} pane={} agent={} thread_id={:?} thread_name={:?} changed={changed}",
-                session, pane_id, snapshot.agent, snapshot.thread_id, snapshot.thread_name,
-            ));
-        }
-        true
+        self.agent_tracker
+            .lock()
+            .unwrap()
+            .apply_event_from(event, Source::Transcript)
     }
 
     fn resolve_agent_watcher_session(&self, snapshot: &AgentWatcherSnapshot) -> Option<String> {
@@ -1438,33 +1430,17 @@ impl ReadOnlyMuxStateSource {
         if let Some(pane_id) = pane_id {
             return Some((provider, pane_id.to_string()));
         }
-        self.sync_agent_pane_presence();
-        if let Some(pane_id) = self.resolve_tracked_agent_pane(session, agent, thread_id) {
+        self.sync_agents();
+        if let Some(pane_id) = thread_id.and_then(|thread_id| {
+            self.agent_tracker
+                .lock()
+                .unwrap()
+                .live_pane_for(session, agent, thread_id)
+        }) {
             return Some((provider, pane_id));
         }
         let pane_id = provider.resolve_agent_pane_id(session, agent, thread_id, thread_name)?;
         Some((provider, pane_id))
-    }
-
-    fn resolve_tracked_agent_pane(
-        &self,
-        session: &str,
-        agent: &str,
-        thread_id: Option<&str>,
-    ) -> Option<String> {
-        let thread_id = thread_id?;
-        self.agent_tracker
-            .lock()
-            .unwrap()
-            .get_agents(session)
-            .into_iter()
-            .find(|event| {
-                event.agent == agent
-                    && event.thread_id.as_deref() == Some(thread_id)
-                    && event.liveness == Some(AgentLiveness::Alive)
-                    && event.pane_id.is_some()
-            })
-            .and_then(|event| event.pane_id)
     }
 
     fn sidebar_panes_to_resize(&self, width: u16) -> Vec<String> {
@@ -1988,45 +1964,67 @@ async fn run_agent_watcher_loop(
     shutdown: broadcast::Sender<()>,
 ) {
     let mut shutdown_rx = shutdown.subscribe();
-    let mut interval = tokio::time::interval(Duration::from_millis(AGENT_WATCHER_POLL_MS));
+    let mut interval = tokio::time::interval(Duration::from_millis(AGENT_REGISTRY_POLL_MS));
     interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut last_seen = HashMap::<String, AgentWatcherFingerprint>::new();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut tick = 0_u32;
 
     loop {
         tokio::select! {
             _ = shutdown_rx.recv() => return,
             _ = interval.tick() => {
-                let now = current_time_ms();
-                let snapshots = tokio::task::spawn_blocking(move || scan_agent_watcher_snapshots(now))
-                    .await
-                    .unwrap_or_default();
-                debug_log(format!(
-                    "agent_watcher_loop: tick scanned {} snapshots",
-                    snapshots.len()
-                ));
-                for snapshot in snapshots {
-                    if snapshot.status == AgentStatus::Idle {
-                        continue;
+                tick = tick.wrapping_add(1);
+                let mut changed = false;
+
+                // Registry: cheap, every tick. The pane listing it needs is
+                // reused for the sync so this costs two tmux calls per tick.
+                let (panes, focus) = source.observe_mux();
+                changed = source.apply_claude_registry(&panes, home.as_deref()) || changed;
+                changed = source.sync_agents_with(&panes, &focus) || changed;
+
+                if tick.is_multiple_of(AGENT_TRANSCRIPT_TICK_EVERY) {
+                    let now = current_time_ms();
+                    let snapshots = tokio::task::spawn_blocking(move || scan_agent_watcher_snapshots(now))
+                        .await
+                        .unwrap_or_default();
+                    debug_log(format!(
+                        "agent_watcher_loop: tick scanned {} snapshots",
+                        snapshots.len()
+                    ));
+                    let mut keys_this_tick = HashSet::new();
+                    for snapshot in snapshots {
+                        if snapshot.status == AgentStatus::Idle {
+                            continue;
+                        }
+                        let key = agent_watcher_key(&snapshot);
+                        keys_this_tick.insert(key.clone());
+                        let fingerprint = AgentWatcherFingerprint::from(&snapshot);
+                        if last_seen.get(&key) == Some(&fingerprint) {
+                            continue;
+                        }
+                        let agent = snapshot.agent.to_string();
+                        let status = snapshot.status;
+                        let thread_name = snapshot.thread_name.clone();
+                        if source.apply_agent_watcher_snapshot(snapshot) {
+                            debug_log(format!(
+                                "agent_watcher_loop: applied snapshot agent={agent} status={status:?} thread={thread_name:?}",
+                            ));
+                            last_seen.insert(key, fingerprint);
+                            changed = true;
+                        } else {
+                            debug_log(format!(
+                                "agent_watcher_loop: dropped snapshot agent={agent} status={status:?} (no matching session)",
+                            ));
+                        }
                     }
-                    let key = agent_watcher_key(&snapshot);
-                    let fingerprint = AgentWatcherFingerprint::from(&snapshot);
-                    if last_seen.get(&key) == Some(&fingerprint) {
-                        continue;
-                    }
-                    let agent = snapshot.agent.to_string();
-                    let status = snapshot.status;
-                    let thread_name = snapshot.thread_name.clone();
-                    if source.apply_agent_watcher_snapshot(snapshot) {
-                        debug_log(format!(
-                            "agent_watcher_loop: applied snapshot agent={agent} status={status:?} thread={thread_name:?}",
-                        ));
-                        last_seen.insert(key, fingerprint);
-                        let _ = state_updates.send(source.snapshot_json());
-                    } else {
-                        debug_log(format!(
-                            "agent_watcher_loop: dropped snapshot agent={agent} status={status:?} (no matching session)",
-                        ));
-                    }
+                    // Transcripts that stopped being recent are re-applied
+                    // if they ever come back, instead of pinning memory.
+                    last_seen.retain(|key, _| keys_this_tick.contains(key));
+                }
+
+                if changed {
+                    let _ = state_updates.send(source.snapshot_json());
                 }
             }
         }

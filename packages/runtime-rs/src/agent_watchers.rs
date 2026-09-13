@@ -1,5 +1,4 @@
 use std::ffi::OsStr;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -729,6 +728,8 @@ fn is_uuid(candidate: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     fn scratch_home(name: &str) -> PathBuf {

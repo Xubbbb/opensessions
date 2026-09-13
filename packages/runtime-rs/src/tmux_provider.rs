@@ -1021,10 +1021,6 @@ pub fn agent_panes_from(panes: &[MuxPane]) -> Vec<AgentPane> {
         .collect()
 }
 
-fn agent_from_pane(pane: &PaneInfo) -> Option<String> {
-    detect_agent(&pane.title, &pane.command)
-}
-
 /// Which agent CLI, if any, a pane with this title and current command looks
 /// like it is running.
 pub fn detect_agent(title: &str, command: &str) -> Option<String> {
@@ -1289,6 +1285,7 @@ mod tests {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn full_pane_row(
         id: &str,
         session: &str,
@@ -1598,36 +1595,17 @@ mod tests {
 
     #[test]
     fn agent_detection_matches_whole_words_only() {
-        let pane = |title: &str, command: &str| PaneInfo {
-            id: "%1".into(),
-            session_name: "s".into(),
-            window_id: "@1".into(),
-            window_index: 0,
-            index: 0,
-            active: false,
-            tty: String::new(),
-            pid: 0,
-            cwd: String::new(),
-            command: command.into(),
-            title: title.into(),
-            width: 80,
-            height: 24,
-            left: 0,
-            right: 79,
-            dead: false,
-            window_active: true,
-        };
         assert_eq!(
-            agent_from_pane(&pane("host", "claude")).as_deref(),
+            detect_agent("host", "claude").as_deref(),
             Some("claude-code")
         );
         assert_eq!(
-            agent_from_pane(&pane("Fix focus - amp - T1", "node")).as_deref(),
+            detect_agent("Fix focus - amp - T1", "node").as_deref(),
             Some("amp")
         );
-        assert_eq!(agent_from_pane(&pane("example", "bash")), None);
-        assert_eq!(agent_from_pane(&pane("claude-docs", "bash")), None);
-        assert_eq!(agent_from_pane(&pane("sample notes", "vim")), None);
+        assert_eq!(detect_agent("example", "bash"), None);
+        assert_eq!(detect_agent("claude-docs", "bash"), None);
+        assert_eq!(detect_agent("sample notes", "vim"), None);
     }
 
     #[test]
