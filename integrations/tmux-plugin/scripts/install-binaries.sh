@@ -4,7 +4,7 @@ set -eu
 
 PLUGIN_DIR="${1:-$(cd "$(dirname "$0")/../../.." && pwd)}"
 VERSION="${OPENSESSIONS_RELEASE_VERSION:-$(grep -o '"version": *"[^"]*"' "$PLUGIN_DIR/package.json" 2>/dev/null | head -1 | cut -d'"' -f4)}"
-RELEASE_BASE="${OPENSESSIONS_RELEASE_BASE:-https://github.com/ataraxy-labs/opensessions/releases/download}"
+RELEASE_BASE="${OPENSESSIONS_RELEASE_BASE:-https://github.com/Xubbbb/opensessions/releases/download}"
 BIN_DIR="$PLUGIN_DIR/bin"
 
 if [ "${OPENSESSIONS_SKIP_BINARY_DOWNLOAD:-}" = "1" ]; then
@@ -34,10 +34,12 @@ target_triple() {
 download() {
   url="$1"
   dest="$2"
+  # Bounded: this runs synchronously while tmux loads its config, so a
+  # stalled connection must not hang the tmux startup.
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$url" -o "$dest"
+    curl -fsSL --connect-timeout 10 -m 180 "$url" -o "$dest"
   elif command -v wget >/dev/null 2>&1; then
-    wget -qO "$dest" "$url"
+    wget -q --timeout=10 --tries=2 -O "$dest" "$url"
   else
     echo "opensessions: curl or wget is required to download prebuilt binaries" >&2
     return 1

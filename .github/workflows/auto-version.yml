@@ -6,6 +6,13 @@ on:
 
 permissions:
   contents: write
+  actions: write
+
+# One bump at a time: two pushes to main racing here would compute the same
+# next version and one of them would push an orphan tag.
+concurrency:
+  group: auto-version
+  cancel-in-progress: false
 
 jobs:
   version:
@@ -64,4 +71,15 @@ jobs:
           git add package.json
           git commit -m "chore: bump version to $NEXT [skip ci]"
           git tag "v$NEXT"
-          git push origin main --tags
+          # Push the commit and the tag atomically so a push rejected by a
+          # concurrent commit cannot leave a tag pointing at an unpushed commit.
+          git push --atomic origin main "refs/tags/v$NEXT"
+
+      # A tag pushed with GITHUB_TOKEN never fires `on: push: tags` workflows
+      # (and the commit carries [skip ci]), so start the release explicitly.
+      # workflow_dispatch is one of the events GITHUB_TOKEN may trigger.
+      - name: Start the release build for the new tag
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh workflow run release.yml --ref "v${{ steps.version.outputs.next }}"

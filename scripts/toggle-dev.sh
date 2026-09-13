@@ -7,12 +7,21 @@
 #
 # Prerequisites:
 #   Your tmux.conf must have both lines (one commented out):
-#     set -g @plugin 'Ataraxy-Labs/opensessions'
+#     set -g @plugin 'Xubbbb/opensessions'
 #     # run '<path-to-workspace>/opensessions.tmux'
 
 CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DEV_LINE="run '${CURRENT_DIR}/opensessions.tmux'"
-TPM_LINE="set -g @plugin 'Ataraxy-Labs/opensessions'"
+TPM_LINE="set -g @plugin 'Xubbbb/opensessions'"
+
+# GNU sed takes `-i` bare; BSD/macOS sed needs `-i ''`.
+sed_inplace() {
+  if sed --version >/dev/null 2>&1; then
+    sed -i "$@"
+  else
+    sed -i '' "$@"
+  fi
+}
 
 CONF="${XDG_CONFIG_HOME:-$HOME/.config}/tmux/tmux.conf"
 [ ! -f "$CONF" ] && CONF="$HOME/.tmux.conf"
@@ -44,12 +53,12 @@ if [ "$TARGET" = "$CURRENT" ]; then
 fi
 
 if [ "$TARGET" = "dev" ]; then
-  sed -i '' "s|^${TPM_LINE}|# ${TPM_LINE}|" "$CONF"
-  sed -i '' "s|^# *${DEV_LINE}|${DEV_LINE}|" "$CONF"
+  sed_inplace "s|^${TPM_LINE}|# ${TPM_LINE}|" "$CONF"
+  sed_inplace "s|^# *${DEV_LINE}|${DEV_LINE}|" "$CONF"
   echo "✓ Switched to DEV (${CURRENT_DIR})"
 else
-  sed -i '' "s|^run '.*opensessions.tmux'|# ${DEV_LINE}|" "$CONF"
-  sed -i '' "s|^# *${TPM_LINE}|${TPM_LINE}|" "$CONF"
+  sed_inplace "s|^run '.*opensessions.tmux'|# ${DEV_LINE}|" "$CONF"
+  sed_inplace "s|^# *${TPM_LINE}|${TPM_LINE}|" "$CONF"
   echo "✓ Switched to PROD (TPM)"
 fi
 

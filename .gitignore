@@ -5,3 +5,5 @@ target
 *.log
 .DS_Store
 .agents/skills/grill-me/
+# Prebuilt release binaries downloaded by opensessions.tmux on first load
+bin/
