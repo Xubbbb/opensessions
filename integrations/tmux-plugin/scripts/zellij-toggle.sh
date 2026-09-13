@@ -27,7 +27,7 @@ fi
 
 # --- Ensure server is running ---
 server_alive() {
-    curl -s -o /dev/null -m 0.2 "http://${HOST}:${PORT}/" 2>/dev/null
+    curl -s -o /dev/null -m 0.2 --noproxy '*' "http://${HOST}:${PORT}/" 2>/dev/null
 }
 
 if ! server_alive; then
@@ -59,4 +59,4 @@ except: print('0')" 2>/dev/null || echo "0")
 fi
 
 CTX="|${SESSION_NAME}|${TAB_ID}"
-curl -s -o /dev/null -m 0.2 --connect-timeout 0.1 -X POST "http://${HOST}:${PORT}/toggle" -d "$CTX"
+curl -s -o /dev/null -m 0.2 --connect-timeout 0.1 --noproxy '*' -X POST "http://${HOST}:${PORT}/toggle" -d "$CTX"

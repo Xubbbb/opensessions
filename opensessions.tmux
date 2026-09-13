@@ -3,7 +3,7 @@
 # Registers keybindings and bootstraps the TUI if needed.
 #
 # Install:
-#   1. Add to .tmux.conf:  set -g @plugin 'Ataraxy-Labs/opensessions'
+#   1. Add to .tmux.conf:  set -g @plugin 'Xubbbb/opensessions'
 #   2. Press prefix + I to install
 #   3. Prebuilt release binaries are downloaded automatically on first load
 #
@@ -77,8 +77,18 @@ RUNNING_VERSION=""
 [ -f "$VERSION_FILE" ] && RUNNING_VERSION=$(cat "$VERSION_FILE" 2>/dev/null)
 
 if [ "$CURRENT_VERSION" != "$RUNNING_VERSION" ]; then
+  # Ask the running server to quit (it tells its sidebars to exit and removes
+  # its hooks); fall back to a signal only when the pid still belongs to an
+  # opensessions-server, never to whatever process reused a stale pid.
+  if server_alive; then
+    curl -s -o /dev/null -m 1 --noproxy '*' -X POST "http://${HOST}:${PORT}/quit" 2>/dev/null || true
+    sleep 0.3
+  fi
   if [ -f "$PID_FILE" ]; then
-    kill "$(cat "$PID_FILE")" 2>/dev/null || true
+    OLD_PID="$(cat "$PID_FILE" 2>/dev/null)"
+    if [ -n "$OLD_PID" ] && ps -o comm= -p "$OLD_PID" 2>/dev/null | grep -q '^opensessions-se'; then
+      kill "$OLD_PID" 2>/dev/null || true
+    fi
     rm -f "$PID_FILE"
   fi
 

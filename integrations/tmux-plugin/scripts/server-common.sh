@@ -69,7 +69,7 @@ show_startup_error() {
 }
 
 server_alive() {
-  curl -s -o /dev/null -m 0.2 "http://${HOST}:${PORT}/" 2>/dev/null
+  curl -s -o /dev/null -m 0.2 --noproxy '*' "http://${HOST}:${PORT}/" 2>/dev/null
 }
 
 acquire_start_lock() {
