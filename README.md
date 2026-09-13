@@ -213,4 +213,4 @@ For the full tmux workflow with keybindings, troubleshooting, and configuration 
 
 ## License
 
-MIT. Originally developed by Ataraxy Labs and contributors; maintained here as a fork.
+MIT. Originally developed by Ataraxy Labs and contributors; maintained here as a fork
