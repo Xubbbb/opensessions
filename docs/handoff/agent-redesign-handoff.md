@@ -4,13 +4,13 @@ Written 2026-09-13 at the end of the fork's first maintenance session. Read this
 
 ## 1. Where the repository stands
 
-- Fork: `Xubbbb/opensessions` of the dormant `Ataraxy-Labs/opensessions` (last upstream release v0.2.0-alpha.12). The user still runs the upstream TPM install locally and will switch once the fork ships a release.
-- The working tree carries two large **uncommitted** passes (nothing has been committed yet — the user decides how to split commits):
-  1. the initial bug-fix pass (release retargeting, `build.rs` version, fish-shell spawn via `split-window -e`, hook array slot 90210, opt-in capped debug log, agent pruning, `/pane-died`, `CLAUDE_CONFIG_DIR`, lsof, uninstall, graceful SIGTERM, tmux utempter SIGCHLD nudge);
-  2. 36 fixes from the audit (see `audit-findings.md`, status `fixed`), including: exact tmux session targets (`=name:`), width-repair loop guard, session ids in hook bodies, HTTP body cap/timeouts, server exits when its tmux server dies, config `theme`/`sidebarPosition`/`sessionFilter` applied and persisted, session order persisted, proxy-proof loopback curls, `focus.sh` no longer toggling every sidebar off, theme picker/scroll fixes, refocus to the previously active pane.
-- Verified state: `cargo test --workspace` green (74 unit tests); tmux E2E 23/23 in most runs, with residual flakiness in the agent seen-marking tests that the redesign will make obsolete. `cargo clippy` shows only the 12 warnings upstream already had.
-- `Xubbbb/lazydiff` was re-forked with all tags, so `release.yml`'s `LAZYDIFF_REF: v0.1.0-alpha.18` resolves. `Xubbbb/opensessions` has no tags; that is fine (do **not** push the 53 upstream tags — each tag push would trigger a release build).
+- Fork: `Xubbbb/opensessions` of the dormant `Ataraxy-Labs/opensessions` (last upstream release v0.2.0-alpha.12). Everything below is committed and pushed; `main` is the working branch.
+- First fork release **v0.2.0-alpha.13** was published on 2026-09-13 by the CI chain (push to `main` → `auto-version` bumps `package.json`, tags, dispatches `release.yml` → four platform bundles). All three GitHub workflows were green, including the tmux E2E that upstream never had green. The user's machine now runs the fork via TPM (`~/.tmux.conf` → `Xubbbb/opensessions`, bundle alpha.13).
+- The history on `main` is ten subsystem commits from the first maintenance session (fork chore, debug log, tmux provider, agents, server, sidebar, e2e, plugin scripts, docs, handoff) plus `scripts/isolated-tmux.sh`. They cover the initial bug-fix pass (release retargeting, `build.rs` version, fish-shell spawn via `split-window -e`, hook array slot 90210, opt-in capped debug log, agent pruning, `/pane-died`, `CLAUDE_CONFIG_DIR`, lsof, uninstall, graceful SIGTERM, tmux utempter SIGCHLD nudge) and 36 audit fixes (see `audit-findings.md`, status `fixed`): exact tmux session targets (`=name:`), width-repair loop guard, session ids in hook bodies, HTTP body cap/timeouts, server exits when its tmux server dies, config `theme`/`sidebarPosition`/`sessionFilter` applied and persisted, session order persisted, proxy-proof loopback curls, `focus.sh` no longer toggling every sidebar off, theme picker/scroll fixes, refocus to the previously active pane.
+- Verified state at v0.2.0-alpha.13: 74 unit tests green; tmux E2E 23/23 locally in most runs (residual flakiness in the agent seen-marking tests that the redesign will make obsolete) and green on CI; `cargo clippy` shows only the 12 warnings upstream already had.
+- `Xubbbb/lazydiff` was re-forked with all tags, so `release.yml`'s `LAZYDIFF_REF: v0.1.0-alpha.18` resolves. `Xubbbb/opensessions` has only its own tags; do **not** push the 53 upstream tags (each tag push would trigger a release build).
 - No `LICENSE` file exists upstream or here despite the MIT badge; the user has been told.
+- To exercise a build without disturbing the user's tmux: `cargo build --release && scripts/isolated-tmux.sh` (own socket/port/hooks; shares `~/.config/opensessions` and agent transcripts on purpose); `scripts/isolated-tmux.sh --stop` tears it down.
 
 ## 2. How agents are identified today (the thing being redesigned)
 
@@ -65,7 +65,8 @@ Decide these during the design (they were raised by the audit and left open on p
 - Never run `tmux` without `-L <private socket>` in experiments; the user's live tmux (default socket) and the live upstream server on `127.0.0.1:24500` are off limits. `target/debug/opensessions-server` has no CLI flags — it binds a port and blocks; run it in the background with `OPENSESSIONS_PORT`, `OPENSESSIONS_PID_FILE`, `HOME`, `TMUX` pointed at scratch values.
 - tmux ≤ 3.5a on Debian/Ubuntu loses `SIGCHLD` for exiting pane processes (tmux #4559); `nudge_dead_panes` in the poll loop works around it. tmux also expands `$name` inside hook bodies unless escaped — build hook bodies only through `tmux_scripting::run_shell_command`.
 - Keep `AGENTS.md` rules: no pane-derived agent status as a source of truth, sync `MuxProvider` methods, HTTP-first integrations, `SERVER_VERSION` from `package.json`.
-- Debug logging is opt-in: `OPENSESSIONS_DEBUG_LOG=<path>` (capped at 16 MB) — the E2E lab sets it per run.
+- Debug logging is opt-in: `OPENSESSIONS_DEBUG_LOG=<path>` (capped at 16 MB) — the E2E lab sets it per run, and `scripts/isolated-tmux.sh` logs to `/tmp/opensessions-<socket>-debug.log`.
+- Every push to `main` publishes a release (auto-version → tag → release build). Commit on a branch, land with `git merge --ff-only`, and push when the work is ready to ship; releases are the only way TPM users get binaries.
 
 ## 7. Init prompt for the next session
 
