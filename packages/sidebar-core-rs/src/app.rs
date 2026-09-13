@@ -7,7 +7,7 @@ use crate::generated::protocol::{
     AgentEvent, AgentLiveness, AgentPanelScope, AgentStatus, ClientCommand, ServerMessage,
     ServerState, SessionData, SessionFilterMode,
 };
-use crate::renderer::{AgentPaneTarget, HitTarget, agent_focus_target};
+use crate::renderer::{AgentPaneTarget, HitTarget, THEME_NAMES, agent_focus_target};
 pub use crate::session_display::DisplaySessionEntry;
 use crate::session_display::{session_display_entries, worktree_group_key};
 
@@ -254,7 +254,13 @@ impl App {
                 self.initializing = state.initializing;
                 self.init_label = state.init_label;
                 self.apply_server_sidebar_width(state.sidebar_width.min(u16::MAX as u32) as u16);
-                self.theme = state.theme;
+                if let Modal::ThemePicker { original_theme, .. } = &mut self.modal {
+                    // A broadcast must not undo the live preview; remember the
+                    // server's value so Esc still reverts to it.
+                    *original_theme = state.theme;
+                } else {
+                    self.theme = state.theme;
+                }
                 self.ts = state.ts;
                 self.session_filter = state.session_filter.unwrap_or_default();
                 self.apply_server_agent_panel_scope(state.agent_panel_scope);
@@ -270,7 +276,12 @@ impl App {
                     self.rehome_missing_focus();
                 }
                 self.clear_background_pending_switch(server_current.as_deref());
-                self.clamp_session_scroll_offset(0);
+                // Keep the user's scroll position; only pull it back if the
+                // list shrank underneath it (the renderer clamps to the
+                // viewport itself).
+                let entries = self.display_session_entries().len();
+                self.session_scroll_offset =
+                    self.session_scroll_offset.min(entries.saturating_sub(1));
             }
             ServerMessage::YourSession { name, .. } => {
                 self.confirm_local_session(name, true);
@@ -803,7 +814,23 @@ impl App {
     }
 
     pub fn confirm_theme_picker(&mut self) {
-        if let Some(name) = self.theme.clone() {
+        // Send the highlighted entry, which is what the overlay shows, rather
+        // than whatever `theme` currently holds.
+        let chosen = match &self.modal {
+            Modal::ThemePicker {
+                query, selected, ..
+            } => {
+                let query = query.to_lowercase();
+                THEME_NAMES
+                    .iter()
+                    .filter(|name| query.is_empty() || name.contains(&query))
+                    .nth(*selected)
+                    .map(|name| name.to_string())
+            }
+            _ => None,
+        };
+        if let Some(name) = chosen.or_else(|| self.theme.clone()) {
+            self.theme = Some(name.clone());
             self.commands.push(ClientCommand::SetTheme { theme: name });
         }
         self.modal = Modal::None;

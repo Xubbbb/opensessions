@@ -395,8 +395,11 @@ fn render_sessions(
         .unwrap_or(0);
 
     let total_rows = rows.len();
-    let visible_cards = available.div_ceil(2).max(1);
-    let max_first_visible = entries.len().saturating_sub(visible_cards);
+    // The furthest entry the list may start at while still filling the
+    // viewport, measured in real rows (sessions and groups differ in height)
+    // rather than an assumed rows-per-card constant, so wheel scrolling can
+    // reach the last entries.
+    let max_first_visible = max_first_visible_entry(&rows, available);
     let first_visible = if total_rows <= available {
         0
     } else if app.session_scroll_follows_focus() {
@@ -576,6 +579,30 @@ fn flatten_session_rows<'a>(entries: &'a [DisplaySessionEntry<'a>]) -> Vec<Sessi
         }
     }
     rows
+}
+
+/// Largest entry index the list may start at while still filling the
+/// viewport: walk back from the last row until the tail no longer fits in
+/// `available` rows, then snap to an entry boundary.
+fn max_first_visible_entry(rows: &[SessionListRow<'_>], available: usize) -> usize {
+    let Some(last) = rows.last() else {
+        return 0;
+    };
+    let mut start = rows.len();
+    while start > 0 && rows.len() - (start - 1) <= available {
+        start -= 1;
+    }
+    if start == 0 {
+        return 0;
+    }
+    let entry = rows[start].entry_idx();
+    // A tail that begins inside an entry would cut that entry's first rows;
+    // start at the following entry instead (blank rows beat a cut card).
+    if rows[start - 1].entry_idx() == entry {
+        (entry + 1).min(last.entry_idx())
+    } else {
+        entry
+    }
 }
 
 fn row_index_for_entry(rows: &[SessionListRow<'_>], entry_idx: usize) -> usize {
@@ -1479,13 +1506,15 @@ fn render_theme_picker_overlay(
     query: &str,
     selected: usize,
 ) {
-    let box_width: usize = 28;
-    let visible_items: usize = 12;
-    // title + search + blank + items + blank + footer
-    let box_height = 4 + visible_items + 1;
-    if height < box_height + 2 || width < box_width + 2 {
+    // Fit the box to the pane: the default sidebar is 26 columns wide, and
+    // an overlay that refuses to draw would still swallow every keypress.
+    let box_width: usize = 28.min(width.saturating_sub(2));
+    if box_width < 12 || height < 8 {
         return;
     }
+    // title + search + blank + items + blank + footer
+    let visible_items: usize = height.saturating_sub(7).clamp(1, 12);
+    let box_height = 4 + visible_items + 1;
 
     let filtered: Vec<&str> = THEME_NAMES
         .iter()
@@ -1585,7 +1614,7 @@ fn render_theme_picker_overlay(
             } else {
                 palette.subtext0
             };
-            let display = format!("{prefix}{name}");
+            let display = truncate_right(&format!("{prefix}{name}"), inner_width);
             let pad = inner_width.saturating_sub(display.width());
             item_line.push(display, name_color);
             item_line.push(" ".repeat(pad), palette.white);

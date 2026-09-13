@@ -8,6 +8,7 @@ use crossterm::event::{
 use crossterm::execute;
 use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
 use futures_util::{SinkExt, StreamExt};
+use opensessions_runtime::debug_log::log_with_tag;
 use opensessions_sidebar::app::{App, LaunchTarget};
 use opensessions_sidebar::cli::{Args, resolve_endpoint_from_env};
 use opensessions_sidebar::client::{
@@ -23,6 +24,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use std::io;
 use std::path::Path;
+use std::sync::OnceLock;
 use tokio::net::TcpStream;
 use tokio_websockets::{MaybeTlsStream, Message, WebSocketStream};
 
@@ -37,34 +39,13 @@ struct PendingSidebarWidthCommand {
     due_at: std::time::Instant,
 }
 
-/// Append a single debug line. Temporarily defaults to `/tmp/opensessions-debug.log`
-/// so live focus/agent-state issues can be diagnosed without extra env setup;
-/// `OPENSESSIONS_DEBUG_LOG` still overrides the path when set.
+/// Append one line to the shared debug log (see
+/// `opensessions_runtime::debug_log`); a no-op unless `OPENSESSIONS_DEBUG_LOG`
+/// is set.
 fn debug_log(line: impl AsRef<str>) {
-    use std::io::Write;
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let path = std::env::var("OPENSESSIONS_DEBUG_LOG")
-        .ok()
-        .unwrap_or_else(|| "/tmp/opensessions-debug.log".to_string());
-    if path.is_empty() {
-        return;
-    }
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let _ = writeln!(
-            file,
-            "[{now}] [sidebar pid={}] {}",
-            std::process::id(),
-            line.as_ref()
-        );
-    }
+    static TAG: OnceLock<String> = OnceLock::new();
+    let tag = TAG.get_or_init(|| format!("sidebar pid={}", std::process::id()));
+    log_with_tag(tag, line);
 }
 
 #[tokio::main(flavor = "current_thread")]

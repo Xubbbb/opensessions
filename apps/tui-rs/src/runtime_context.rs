@@ -86,15 +86,58 @@ where
         "-t",
         &window_id,
         "-F",
-        "#{pane_id} #{pane_title}",
+        "#{pane_id}\t#{pane_last}\t#{pane_title}",
     ])?;
-    let main_line = panes
+    let candidates = panes
         .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty() && !line.contains("opensessions-sidebar"))?;
-    let main_pane = main_line.split_whitespace().next()?;
+        .filter_map(|line| {
+            let mut parts = line.trim().splitn(3, '\t');
+            let id = parts.next()?.trim();
+            let last = parts.next()?.trim() == "1";
+            let title = parts.next().unwrap_or_default();
+            (!id.is_empty() && title != "opensessions-sidebar").then_some((id.to_string(), last))
+        })
+        .collect::<Vec<_>>();
+    // Spawning the sidebar made it the active pane; the pane the user was
+    // in is now tmux's "last" pane. Go back there rather than to whichever
+    // content pane happens to be listed first.
+    let main_pane = candidates
+        .iter()
+        .find(|(_, last)| *last)
+        .or_else(|| candidates.first())
+        .map(|(id, _)| id.clone())?;
 
     Some(RefocusPlan {
-        select_pane: main_pane.to_string(),
+        select_pane: main_pane,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmux(args: &[&str]) -> Option<String> {
+        match args.first().copied() {
+            Some("list-panes") => {
+                Some("%5\t0\topensessions-sidebar\n%1\t0\tbash\n%3\t1\tnvim main.rs\n".to_string())
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn refocus_returns_to_the_previously_active_pane() {
+        let plan = refocus_plan("%5", Some("@1"), tmux).expect("plan");
+        assert_eq!(plan.select_pane, "%3");
+    }
+
+    #[test]
+    fn refocus_falls_back_to_first_content_pane_without_a_last_pane() {
+        let plan = refocus_plan("%5", Some("@1"), |args| match args.first().copied() {
+            Some("list-panes") => Some("%5\t0\topensessions-sidebar\n%1\t0\tbash\n".to_string()),
+            _ => None,
+        })
+        .expect("plan");
+        assert_eq!(plan.select_pane, "%1");
+    }
 }
