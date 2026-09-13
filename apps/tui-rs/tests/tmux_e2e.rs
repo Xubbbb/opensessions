@@ -1751,11 +1751,19 @@ time.sleep(300)
     }
 
     fn wait_for_no_sidebar_processes(&self) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // After the server is killed, each sidebar exits on its closed
+        // websocket, its pane goes dead (remain-on-exit), and tmux's
+        // `pane-died` hook reaps the pane. tmux <= 3.5a built with utempter
+        // can lose the SIGCHLD for an exiting pane process (tmux issue
+        // #4559), in which case `pane-died` never fires on its own; the
+        // running server works around that by nudging tmux, but here the
+        // server is dead, so the lab nudges instead.
+        let deadline = Instant::now() + Duration::from_secs(15);
         while Instant::now() < deadline {
             if self.sidebar_panes().is_empty() {
                 return;
             }
+            self.tmux(["run-shell", "-b", "true"]);
             sleep(Duration::from_millis(100));
         }
         panic!(
@@ -1866,19 +1874,25 @@ time.sleep(300)
 
     fn sidebar_pane_in_window(&self, session: &str, window: &str) -> String {
         let target = format!("{session}:{window}");
+        // Match on the pane title as well as the command: when tmux's
+        // default-shell is bash, a `2>log` redirect in the spawn command
+        // disables bash's exec optimization, so `pane_current_command` stays
+        // `bash` even though the sidebar is running underneath it.
         let output = self.tmux([
             "list-panes",
             "-t",
             &target,
             "-F",
-            "#{pane_id} #{pane_current_command}",
+            "#{pane_id}\t#{pane_current_command}\t#{pane_title}",
         ]);
         output
             .lines()
             .find_map(|line| {
-                let (pane, command) = line.split_once(' ')?;
-                command
-                    .starts_with("opensessions")
+                let mut parts = line.split('\t');
+                let pane = parts.next()?;
+                let command = parts.next()?;
+                let title = parts.next()?;
+                (title == "opensessions-sidebar" || command.starts_with("opensessions"))
                     .then(|| pane.to_string())
             })
             .unwrap_or_else(|| panic!("no sidebar pane found for {target}; panes:\n{output}"))
