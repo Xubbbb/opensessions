@@ -137,6 +137,15 @@ cargo test --workspace
 
 `cargo test --workspace` includes the tmux end-to-end suite, which starts private tmux servers on their own sockets and needs `tmux`, `git`, and `python3` on `PATH`.
 
+To try a build without touching the tmux server you work in, start an isolated one — its own socket, sessions, hooks, and opensessions server on its own port:
+
+```bash
+cargo build --release && scripts/isolated-tmux.sh      # attach; prefix o → s opens the sidebar
+scripts/isolated-tmux.sh --stop                         # tear it down
+```
+
+It loads your `~/.tmux.conf` minus plugin lines plus this checkout's `opensessions.tmux`, shares your `~/.config/opensessions/` settings and agent transcripts so real state shows up, and logs to `/tmp/opensessions-ostest-debug.log`. Run it from a terminal outside your normal tmux; started from inside, the inner prefix becomes `C-a`.
+
 To point your own tmux at the checkout instead of the TPM copy, add `run '/absolute/path/to/opensessions/opensessions.tmux'` to `~/.tmux.conf` (or use `scripts/toggle-dev.sh` to flip between the two). Set `OPENSESSIONS_SKIP_BINARY_DOWNLOAD=1` in the environment tmux starts from so the checkout uses `target/` builds rather than downloading a release bundle.
 
 Debug logging is off by default. To capture it, set `OPENSESSIONS_DEBUG_LOG` to a file path in tmux's global environment before the server starts (`tmux set-environment -g OPENSESSIONS_DEBUG_LOG /tmp/opensessions-debug.log`, then `q` and reopen the sidebar). The file is capped at 16 MB.
