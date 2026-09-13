@@ -3,7 +3,20 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use crate::protocol::{AgentEvent, AgentLiveness, AgentStatus};
 
 const MAX_EVENT_TIMESTAMPS: usize = 30;
-const TERMINAL_PRUNE_MS: u64 = 5 * 60 * 1000;
+/// How long a seen terminal entry (done/error/interrupted/stale) with no
+/// known pane lingers before it is reaped.
+pub const TERMINAL_PRUNE_MS: u64 = 5 * 60 * 1000;
+/// Unseen terminal entries stay longer so a finished agent's marker is not
+/// reaped before the user had a chance to notice it.
+pub const UNSEEN_TERMINAL_PRUNE_MS: u64 = 30 * 60 * 1000;
+/// Grace period after an agent's pane disappears before its terminal entry
+/// is dropped. Long enough to absorb a brief pane-presence flap, short enough
+/// that closing an agent pane visibly clears it from the sidebar.
+pub const EXITED_PRUNE_MS: u64 = 10 * 1000;
+/// Running entries that have no live pane and have not reported for this
+/// long are treated as abandoned (an external agent that crashed without
+/// sending a terminal event).
+pub const STUCK_PRUNE_MS: u64 = 30 * 60 * 1000;
 const SYNTHETIC_PANE_MARKER: &str = ":pane:";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,6 +33,9 @@ pub struct AgentTracker {
     instances: HashMap<String, HashMap<String, AgentEvent>>,
     event_timestamps: HashMap<String, Vec<u64>>,
     unseen_instances: HashSet<String>,
+    /// When an instance's pane was last observed gone, keyed like
+    /// `unseen_instances`. Drives `EXITED_PRUNE_MS`.
+    exited_at: HashMap<String, u64>,
     active: HashSet<String>,
 }
 
@@ -135,8 +151,9 @@ impl AgentTracker {
         }
 
         for key in removed_keys {
-            self.unseen_instances
-                .remove(&self.unseen_key(session, &key));
+            let unseen_key = self.unseen_key(session, &key);
+            self.unseen_instances.remove(&unseen_key);
+            self.exited_at.remove(&unseen_key);
         }
         if should_remove_session {
             self.instances.remove(session);
@@ -182,69 +199,65 @@ impl AgentTracker {
         changed
     }
 
-    pub fn prune_stuck(&mut self, timeout_ms: u64) {
-        let now = now_ms();
-        let sessions = self.instances.keys().cloned().collect::<Vec<_>>();
-        let mut unseen_to_remove = Vec::new();
-
-        for session in sessions {
-            let mut empty = false;
-            if let Some(session_instances) = self.instances.get_mut(&session) {
-                let keys = session_instances
-                    .iter()
-                    .filter(|(_, event)| {
-                        matches!(
-                            event.status,
-                            AgentStatus::Running | AgentStatus::ToolRunning
-                        ) && now.saturating_sub(event.ts) > timeout_ms
-                            && event.liveness != Some(AgentLiveness::Alive)
-                    })
-                    .map(|(key, _)| key.clone())
-                    .collect::<Vec<_>>();
-
-                for key in keys {
-                    session_instances.remove(&key);
-                    unseen_to_remove.push(format!("{session}\0{key}"));
-                }
-                empty = session_instances.is_empty();
-            }
-            if empty {
-                self.instances.remove(&session);
-            }
-        }
-
-        for key in unseen_to_remove {
-            self.unseen_instances.remove(&key);
-        }
+    /// Drop running entries that have no live pane and have been silent for
+    /// longer than `timeout_ms`. Returns whether anything was removed.
+    pub fn prune_stuck(&mut self, now: u64, timeout_ms: u64) -> bool {
+        self.prune_where(|_, event, _| {
+            matches!(
+                event.status,
+                AgentStatus::Running | AgentStatus::ToolRunning
+            ) && event.liveness != Some(AgentLiveness::Alive)
+                && now.saturating_sub(event.ts) > timeout_ms
+        })
     }
 
-    pub fn prune_terminal(&mut self) {
-        let now = now_ms();
-        let sessions = self.instances.keys().cloned().collect::<Vec<_>>();
+    /// Reap terminal entries (done/error/interrupted/stale) whose agent is not
+    /// known to be alive:
+    ///
+    /// - once the agent's pane has been gone for `EXITED_PRUNE_MS`, whether or
+    ///   not the entry was seen;
+    /// - otherwise after `TERMINAL_PRUNE_MS` if seen, or
+    ///   `UNSEEN_TERMINAL_PRUNE_MS` while still unseen.
+    ///
+    /// Returns whether anything was removed.
+    pub fn prune_terminal(&mut self, now: u64) -> bool {
+        self.prune_where(|unseen_key, event, tracker| {
+            if !is_terminal_status(event.status) || event.liveness == Some(AgentLiveness::Alive) {
+                return false;
+            }
+            if let Some(exited_at) = tracker.exited_at.get(unseen_key) {
+                return now.saturating_sub(*exited_at) > EXITED_PRUNE_MS;
+            }
+            let ttl = if tracker.unseen_instances.contains(unseen_key) {
+                UNSEEN_TERMINAL_PRUNE_MS
+            } else {
+                TERMINAL_PRUNE_MS
+            };
+            now.saturating_sub(event.ts) > ttl
+        })
+    }
 
-        for session in sessions {
-            let unseen_instances = self.unseen_instances.clone();
-            let mut empty = false;
-            if let Some(session_instances) = self.instances.get_mut(&session) {
-                let keys = session_instances
+    fn prune_where(&mut self, should_remove: impl Fn(&str, &AgentEvent, &Self) -> bool) -> bool {
+        let doomed = self
+            .instances
+            .iter()
+            .flat_map(|(session, session_instances)| {
+                session_instances
                     .iter()
                     .filter(|(key, event)| {
-                        is_terminal_status(event.status)
-                            && !unseen_instances.contains(&format!("{session}\0{key}"))
-                            && event.liveness != Some(AgentLiveness::Alive)
-                            && now.saturating_sub(event.ts) > TERMINAL_PRUNE_MS
+                        should_remove(&self.unseen_key(session, key), event, self)
                     })
-                    .map(|(key, _)| key.clone())
-                    .collect::<Vec<_>>();
-                for key in keys {
-                    session_instances.remove(&key);
-                }
-                empty = session_instances.is_empty();
-            }
-            if empty {
+                    .map(|(key, _)| (session.clone(), key.clone()))
+            })
+            .collect::<Vec<_>>();
+        let changed = !doomed.is_empty();
+        for (session, key) in doomed {
+            self.remove_instance(&session, &key);
+            if self.instances.get(&session).is_some_and(HashMap::is_empty) {
                 self.instances.remove(&session);
             }
         }
+        changed
     }
 
     pub fn is_unseen(&self, session: &str) -> bool {
@@ -420,6 +433,7 @@ impl AgentTracker {
             .collect::<HashSet<_>>();
 
         let mut unseen_to_remove = Vec::new();
+        let mut exited_keys = Vec::new();
         if let Some(session_instances) = self.instances.get_mut(session) {
             let existing_keys = session_instances.keys().cloned().collect::<Vec<_>>();
             for key in existing_keys {
@@ -452,12 +466,17 @@ impl AgentTracker {
                 } else {
                     event.liveness = Some(AgentLiveness::Exited);
                     event.pane_id = None;
+                    exited_keys.push(format!("{session}\0{key}"));
                 }
                 changed = true;
             }
         }
         for key in unseen_to_remove {
             self.unseen_instances.remove(&key);
+        }
+        let now = now_ms();
+        for key in exited_keys {
+            self.exited_at.entry(key).or_insert(now);
         }
 
         for pane in pane_agents {
@@ -679,6 +698,9 @@ impl AgentTracker {
         }
 
         let unseen_key = self.unseen_key(&event.session, &key);
+        // A fresh event means the agent is producing output again, so any
+        // earlier "pane gone" observation no longer counts against it.
+        self.exited_at.remove(&unseen_key);
         if is_terminal_status(event.status) {
             self.unseen_instances.insert(unseen_key);
         } else {
@@ -790,12 +812,15 @@ impl AgentTracker {
             .get_mut(session)
             .is_some_and(|instances| instances.remove(key).is_some());
         if removed {
-            self.unseen_instances.remove(&self.unseen_key(session, key));
+            let unseen_key = self.unseen_key(session, key);
+            self.unseen_instances.remove(&unseen_key);
+            self.exited_at.remove(&unseen_key);
         }
         removed
     }
 
     fn stamp_alive(&mut self, session: &str, key: &str, pane_id: &str) -> bool {
+        let unseen_key = self.unseen_key(session, key);
         let Some(event) = self
             .instances
             .get_mut(session)
@@ -808,6 +833,7 @@ impl AgentTracker {
             || event.liveness != Some(AgentLiveness::Alive);
         event.pane_id = Some(pane_id.to_string());
         event.liveness = Some(AgentLiveness::Alive);
+        self.exited_at.remove(&unseen_key);
         was_different
     }
 
@@ -1219,5 +1245,114 @@ mod tests {
 
         assert!(tracker.is_unseen("work"));
         assert_eq!(tracker.get_agents("work")[0].unseen, Some(true));
+    }
+
+    fn aged_done_event(session: &str, thread_id: &str, ts: u64) -> AgentEvent {
+        let mut event = event("claude-code", session, Some(thread_id), Some("Task"));
+        event.status = AgentStatus::Done;
+        event.ts = ts;
+        event
+    }
+
+    fn presence(agent: &str, pane_id: &str) -> PanePresenceInput {
+        PanePresenceInput {
+            agent: agent.to_string(),
+            pane_id: pane_id.to_string(),
+            active: false,
+            thread_id: None,
+            thread_name: None,
+        }
+    }
+
+    #[test]
+    fn prune_terminal_reaps_seen_entries_after_ttl_but_keeps_unseen_longer() {
+        let mut tracker = AgentTracker::new();
+        tracker.apply_event(aged_done_event("work", "T-seen", 1_000));
+        tracker.mark_seen("work");
+        // Applied after the session was seen, so this one stays unseen.
+        tracker.apply_event(aged_done_event("work", "T-unseen", 1_000));
+        assert!(tracker.is_unseen("work"));
+
+        assert!(!tracker.prune_terminal(1_000 + TERMINAL_PRUNE_MS));
+        assert!(tracker.prune_terminal(1_000 + TERMINAL_PRUNE_MS + 1));
+        let remaining = tracker.get_agents("work");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].thread_id.as_deref(), Some("T-unseen"));
+
+        assert!(!tracker.prune_terminal(1_000 + UNSEEN_TERMINAL_PRUNE_MS));
+        assert!(tracker.prune_terminal(1_000 + UNSEEN_TERMINAL_PRUNE_MS + 1));
+        assert!(tracker.get_agents("work").is_empty());
+        assert!(!tracker.is_unseen("work"));
+        assert!(tracker.get_state("work").is_none());
+    }
+
+    #[test]
+    fn prune_terminal_keeps_entries_whose_pane_is_alive_regardless_of_age() {
+        let mut tracker = AgentTracker::new();
+        tracker.apply_event(aged_done_event("work", "T-1", 1_000));
+        tracker.apply_pane_presence("work", vec![presence("claude-code", "%7")]);
+        assert_eq!(
+            tracker.get_agents("work")[0].liveness,
+            Some(AgentLiveness::Alive)
+        );
+
+        assert!(!tracker.prune_terminal(1_000 + UNSEEN_TERMINAL_PRUNE_MS * 10));
+        assert_eq!(tracker.get_agents("work").len(), 1);
+    }
+
+    #[test]
+    fn prune_terminal_reaps_shortly_after_the_agent_pane_disappears() {
+        let mut tracker = AgentTracker::new();
+        tracker.apply_event(aged_done_event("work", "T-1", 1_000));
+        tracker.apply_pane_presence("work", vec![presence("claude-code", "%7")]);
+        // Pane gone: liveness flips to Exited and the exit time is recorded.
+        assert!(tracker.apply_pane_presence("work", Vec::new()));
+        assert_eq!(
+            tracker.get_agents("work")[0].liveness,
+            Some(AgentLiveness::Exited)
+        );
+
+        let exited_at = now_ms();
+        assert!(!tracker.prune_terminal(exited_at + EXITED_PRUNE_MS / 2));
+        assert!(tracker.prune_terminal(exited_at + EXITED_PRUNE_MS + 1_000));
+        assert!(tracker.get_agents("work").is_empty());
+    }
+
+    #[test]
+    fn fresh_event_after_pane_exit_cancels_the_exit_grace_period() {
+        let mut tracker = AgentTracker::new();
+        tracker.apply_event(aged_done_event("work", "T-1", 1_000));
+        tracker.apply_pane_presence("work", vec![presence("claude-code", "%7")]);
+        tracker.apply_pane_presence("work", Vec::new());
+
+        let mut resumed = aged_done_event("work", "T-1", now_ms());
+        resumed.status = AgentStatus::Running;
+        tracker.apply_event(resumed);
+        let mut done_again = aged_done_event("work", "T-1", now_ms());
+        done_again.status = AgentStatus::Done;
+        tracker.apply_event(done_again);
+
+        // No longer on the short exit timer; falls back to the unseen TTL.
+        assert!(!tracker.prune_terminal(now_ms() + EXITED_PRUNE_MS * 10));
+        assert_eq!(tracker.get_agents("work").len(), 1);
+    }
+
+    #[test]
+    fn prune_stuck_reaps_silent_running_entries_without_a_live_pane() {
+        let mut tracker = AgentTracker::new();
+        let mut running = event("my-agent", "work", Some("job-1"), None);
+        running.ts = 1_000;
+        tracker.apply_event(running);
+        let mut alive = event("my-agent", "work", Some("job-2"), None);
+        alive.ts = 1_000;
+        alive.pane_id = Some("%3".to_string());
+        alive.liveness = Some(AgentLiveness::Alive);
+        tracker.apply_event(alive);
+
+        assert!(!tracker.prune_stuck(1_000 + STUCK_PRUNE_MS, STUCK_PRUNE_MS));
+        assert!(tracker.prune_stuck(1_000 + STUCK_PRUNE_MS + 1, STUCK_PRUNE_MS));
+        let remaining = tracker.get_agents("work");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].thread_id.as_deref(), Some("job-2"));
     }
 }

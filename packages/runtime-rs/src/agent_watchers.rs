@@ -1,3 +1,7 @@
+use std::ffi::OsStr;
+use std::fs;
+use std::path::{Path, PathBuf};
+
 use serde_json::Value;
 
 use crate::agent_parsers::{
@@ -253,7 +257,7 @@ pub fn pi_snapshot_from_jsonl(
     }
 
     let idle_for = now_ms.saturating_sub(mtime_ms);
-    if status == AgentStatus::Running && idle_for >= STUCK_MS {
+    if matches!(status, AgentStatus::Running | AgentStatus::Waiting) && idle_for >= STUCK_MS {
         status = AgentStatus::Stale;
     }
 
@@ -327,7 +331,7 @@ pub fn droid_snapshot_from_jsonl(
     }
 
     let idle_for = now_ms.saturating_sub(mtime_ms);
-    if status == AgentStatus::Running && idle_for >= STUCK_MS {
+    if matches!(status, AgentStatus::Running | AgentStatus::Waiting) && idle_for >= STUCK_MS {
         status = AgentStatus::Stale;
     }
 
@@ -351,6 +355,62 @@ pub fn codex_thread_id_from_path(path: &str) -> String {
         .unwrap_or_else(|| path.rsplit_once('/').map(|(_, name)| name).unwrap_or(path));
 
     find_uuid_suffix(name).unwrap_or(name).to_string()
+}
+
+/// Every `projects/` directory Claude Code may write transcripts into.
+///
+/// Claude Code keeps its state under `~/.claude` by default, but users running
+/// several accounts point `CLAUDE_CONFIG_DIR` at another directory (commonly a
+/// sibling such as `~/.claude-work`). The result lists, deduplicated and in
+/// this order: the default, the `CLAUDE_CONFIG_DIR` override, then every
+/// existing `~/.claude*/projects` sibling so accounts still show up when the
+/// server was started from a shell that did not export the variable.
+pub fn claude_code_projects_dirs(home: &Path) -> Vec<PathBuf> {
+    claude_code_projects_dirs_from(home, std::env::var_os("CLAUDE_CONFIG_DIR").as_deref())
+}
+
+fn claude_code_projects_dirs_from(home: &Path, config_dir: Option<&OsStr>) -> Vec<PathBuf> {
+    let mut dirs = vec![home.join(".claude/projects")];
+    let mut push_unique = |dir: PathBuf| {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    };
+
+    if let Some(config_dir) = config_dir.filter(|value| !value.is_empty()) {
+        push_unique(expand_home(home, Path::new(config_dir)).join("projects"));
+    }
+
+    let mut siblings = fs::read_dir(home)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with(".claude"))
+        })
+        .map(|entry| entry.path().join("projects"))
+        .filter(|projects| projects.is_dir())
+        .collect::<Vec<_>>();
+    siblings.sort();
+    for projects in siblings {
+        push_unique(projects);
+    }
+
+    dirs
+}
+
+fn expand_home(home: &Path, path: &Path) -> PathBuf {
+    match path.to_str() {
+        Some("~") => home.to_path_buf(),
+        Some(text) => match text.strip_prefix("~/") {
+            Some(rest) => home.join(rest),
+            None => path.to_path_buf(),
+        },
+        None => path.to_path_buf(),
+    }
 }
 
 pub fn decode_claude_project_dir(encoded: &str, exists: impl Fn(&str) -> bool) -> String {
@@ -690,7 +750,11 @@ fn find_uuid_suffix(name: &str) -> Option<&str> {
         return None;
     }
     for start in (0..=len - 36).rev() {
-        let candidate = &name[start..start + 36];
+        // Slice only on char boundaries: a non-ASCII file name must not
+        // panic the scanner (a UUID is ASCII, so such slices cannot match).
+        let Some(candidate) = name.get(start..start + 36) else {
+            continue;
+        };
         if is_uuid(candidate) {
             return Some(candidate);
         }
@@ -708,6 +772,76 @@ fn is_uuid(candidate: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scratch_home(name: &str) -> PathBuf {
+        let home = std::env::temp_dir().join(format!(
+            "opensessions-claude-dirs-{name}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(&home).expect("create scratch home");
+        home
+    }
+
+    #[test]
+    fn uuid_suffix_search_tolerates_non_ascii_file_names() {
+        let name = "rollout-2026-09-12T10-00-00-会話ノート記録テスト用の長い名前-01234567-89ab-cdef-0123-456789abcdef";
+        assert_eq!(
+            find_uuid_suffix(name),
+            Some("01234567-89ab-cdef-0123-456789abcdef")
+        );
+        assert_eq!(
+            find_uuid_suffix("会話ノート会話ノート会話ノート会話ノート会話ノート会話ノート"),
+            None
+        );
+    }
+
+    #[test]
+    fn claude_projects_dirs_include_the_config_dir_override_and_siblings() {
+        let home = scratch_home("siblings");
+        fs::create_dir_all(home.join(".claude/projects")).unwrap();
+        fs::create_dir_all(home.join(".claude-personal/projects")).unwrap();
+        fs::create_dir_all(home.join(".claude-empty")).unwrap();
+        fs::write(home.join(".claude.json"), "{}").unwrap();
+        fs::create_dir_all(home.join(".not-claude/projects")).unwrap();
+
+        let dirs = claude_code_projects_dirs_from(&home, Some(OsStr::new("~/.claude-work")));
+
+        assert_eq!(
+            dirs,
+            vec![
+                home.join(".claude/projects"),
+                home.join(".claude-work/projects"),
+                home.join(".claude-personal/projects"),
+            ]
+        );
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn claude_projects_dirs_deduplicate_override_that_is_also_a_sibling() {
+        let home = scratch_home("dedupe");
+        fs::create_dir_all(home.join(".claude-personal/projects")).unwrap();
+
+        let dirs =
+            claude_code_projects_dirs_from(&home, Some(home.join(".claude-personal").as_os_str()));
+
+        assert_eq!(
+            dirs,
+            vec![
+                home.join(".claude/projects"),
+                home.join(".claude-personal/projects"),
+            ]
+        );
+        assert_eq!(
+            claude_code_projects_dirs_from(&home, Some(OsStr::new(""))),
+            vec![
+                home.join(".claude/projects"),
+                home.join(".claude-personal/projects"),
+            ]
+        );
+        let _ = fs::remove_dir_all(&home);
+    }
 
     #[test]
     fn claude_code_snapshot_tracks_latest_real_user_prompt() {
