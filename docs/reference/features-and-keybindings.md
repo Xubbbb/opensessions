@@ -28,9 +28,10 @@ Clicking a detected port opens `http://localhost:<port>`.
 ## Agent Features
 
 - Multiple agent instances per session when a watcher emits `threadId`
-- Per-instance unseen tracking
-- Status values: `idle`, `running`, `tool-running`, `done`, `error`, `waiting`, `interrupted`, `stale`
-- Finished agents (`done`, `error`, `interrupted`, `stale`) are removed automatically: about 10 seconds after their tmux pane disappears, otherwise after 5 minutes once seen or 30 minutes while still unseen. Running agents with no live pane that stop reporting are dropped after 30 minutes. `d` in the agents panel removes one immediately.
+- Per-instance unseen tracking: a finished agent keeps its `●` until its pane is the active pane of an attached tmux client, until you `Enter` it, or until the session is marked seen
+- Status values: `idle`, `running`, `tool-running`, `done`, `error`, `waiting`, `interrupted`, `stale`; a qualifier in parentheses adds the reason when there is one (`working (delegating)` while background subagents run, `blocked (dialog open)`, `done (shell running)`)
+- Live Claude Code sessions are rows even while idle (`✓ idle`), named after their `/rename` name
+- Agents are removed automatically about 10 seconds after their tmux pane or process disappears, whatever their status. Agents that never had a pane are dropped after 5 minutes once seen or 30 minutes while still unseen when finished, and after 30 minutes of silence otherwise. `d` in the agents panel removes one immediately.
 
 ## Session Metadata Features
 
@@ -89,6 +90,8 @@ Agents panel (`Right`/`Ctrl+J` to enter):
 | `j`/`k`, `Down`/`Up` | Move between agents |
 | `Enter` | Switch to the agent's session and focus its pane |
 | `d` | Dismiss the focused agent from the sidebar |
+
+In the sessions list, `d` on the session your client is attached to does nothing except show a short footer notice: the attached session is always listed.
 | `x` | Kill the agent's tmux pane (falls back to the session kill confirmation when no pane is known) |
 | `Esc`, `Left`, `Ctrl+K` | Back to the sessions panel |
 
@@ -122,13 +125,13 @@ Mouse: click a session row to switch, click a group header to collapse/expand, c
 
 - Git info is cached for 5 seconds.
 - Listening localhost ports are re-polled every 10 seconds (via `lsof`).
-- All built-in agent watchers (Amp, Claude Code, Codex, OpenCode, Pi, Droid) poll every 2 seconds and only look at files modified in the last 5 minutes.
+- The Claude Code session registry is polled every 500 ms. Transcript watchers (Amp, Claude Code, Codex, OpenCode, Pi, Droid) poll every 2 seconds, only look at files modified in the last 5 minutes (plus the transcripts of live Claude Code sessions), and read Claude Code and Codex transcripts incrementally.
 - tmux state is re-polled every 2 seconds as a backstop for anything the hooks missed.
 
 ## Files And Paths The UI Depends On
 
 - `~/.local/share/amp/threads/`
-- `~/.claude/projects/`, `$CLAUDE_CONFIG_DIR/projects/`, and any `~/.claude*/projects/`
+- `~/.claude/sessions/` and `~/.claude/projects/` (also under `$CLAUDE_CONFIG_DIR` and any `~/.claude*/`)
 - `~/.codex/sessions/` (or `$CODEX_HOME/sessions/`)
 - `~/.local/share/opencode/opencode.db` (or `$OPENCODE_DB_PATH`)
 - `~/.pi/agent/sessions/` and `~/.factory/projects/`

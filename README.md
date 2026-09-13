@@ -83,13 +83,13 @@ Then remove the `set -g @plugin 'Xubbbb/opensessions'` line from `~/.tmux.conf` 
 
 ## Today
 
-- Live agent state across sessions for Amp, Claude Code, Codex, and OpenCode.
-- Per-thread unseen markers for `done`, `error`, and `interrupted` states.
+- Live agent state across sessions for Claude Code (from its session registry: exact pane, live status, `/rename` names — no hooks to install), Amp, Codex, and OpenCode.
+- Per-thread unseen markers for `done`, `error`, `interrupted`, and `stale` states, cleared when the agent's pane is the one you are looking at.
 - Session context in the UI: branch in the list, working directory in the detail panel, thread names, and detected localhost ports.
 - Programmatic metadata API: agents and scripts push status, progress, and logs to the sidebar via HTTP.
 - Fast switching with `j`/`k`, arrows, `Tab`, `1`-`9`, session reordering, hide/restore, creation, and kill actions.
 - `prefix o → s` and `prefix o → t` for sidebar focus and toggle, `prefix o → e` for sidebar-safe `even-horizontal` layout in the current window, `prefix o → 1` through `9` for quick switching, optional no-prefix shortcuts, and in-app theme switching.
-- Finished agents leave the sidebar on their own: shortly after their pane closes, or after a timeout otherwise (30 minutes while still unseen, 5 minutes once seen). `d` in the agents panel dismisses one immediately.
+- Agents leave the sidebar on their own: about 10 seconds after their pane or process is gone, or after a timeout for agents that never had a pane (30 minutes while still unseen, 5 minutes once seen). `d` in the agents panel dismisses one immediately.
 - Works with any tmux `default-shell`, including fish; installs its tmux hooks in a dedicated array slot so it coexists with other plugins' hooks.
 - Native Rust sidebar built with ratatui 0.30 and crossterm 0.29, with a local Rust WebSocket/HTTP server.
 
@@ -178,7 +178,7 @@ For the full tmux workflow with keybindings, troubleshooting, and configuration 
 
 - Session ordering is persisted in `~/.config/opensessions/session-order.json`.
 - Amp watcher reads `~/.local/share/amp/threads/*.json`.
-- Claude Code watcher reads JSONL transcripts in `~/.claude/projects/`, plus `$CLAUDE_CONFIG_DIR/projects/` and any sibling `~/.claude*/projects/` directory, so multiple Claude Code accounts all show up.
+- Claude Code sessions come from the registry Claude Code keeps in `~/.claude/sessions/` (also `$CLAUDE_CONFIG_DIR/sessions/` and any sibling `~/.claude*/sessions/`, so multiple accounts show up); their transcripts under the matching `projects/` directory add the title and last prompt and are the fallback for older Claude versions.
 - Codex watcher reads transcript JSONL files in `~/.codex/sessions/` or `$CODEX_HOME/sessions/` and resolves sessions from `turn_context.cwd`.
 - OpenCode watcher polls the SQLite database in `~/.local/share/opencode/opencode.db`.
 - Toggling the sidebar off closes its panes; `prefix o → e` briefly parks the sidebar pane in a tmux session named `_os_stash` while it re-lays out the window.

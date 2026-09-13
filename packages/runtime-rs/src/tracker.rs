@@ -573,11 +573,16 @@ impl AgentTracker {
                         relocations.push((id.clone(), (*session).to_string()));
                     }
                     Some(_) => {
-                        if tracked.gone_since.is_some() {
+                        // A registry row is alive only while its process
+                        // is: the pane outliving the process (a shell prompt
+                        // after /exit) does not revive it.
+                        if tracked.gone_since.is_some() && tracked.source != Source::Registry {
                             tracked.gone_since = None;
                             changed = true;
                         }
-                        if tracked.event.liveness != Some(AgentLiveness::Alive) {
+                        if tracked.gone_since.is_none()
+                            && tracked.event.liveness != Some(AgentLiveness::Alive)
+                        {
                             tracked.event.liveness = Some(AgentLiveness::Alive);
                             changed = true;
                         }
@@ -1321,6 +1326,38 @@ mod tests {
         assert_eq!(row.pane_id, None);
         assert_eq!(row.status, AgentStatus::Running, "status is not guessed");
         assert!(!tracker.prune(NOW + EXITED_PRUNE_MS));
+        assert!(tracker.prune(NOW + EXITED_PRUNE_MS + 1));
+        assert!(tracker.get_agents("work").is_empty());
+    }
+
+    #[test]
+    fn registry_row_stays_gone_while_its_pane_outlives_the_process() {
+        let mut tracker = AgentTracker::new();
+        tracker.apply_registry(
+            vec![registry(
+                "s1",
+                "work",
+                "%7",
+                RegistryStatus::Busy,
+                NOW - 5_000,
+            )],
+            NOW,
+        );
+
+        // /exit: the record is swept, the pane is back at a shell prompt.
+        tracker.apply_registry(vec![], NOW);
+        let changed =
+            tracker.sync_panes(&[shell("%7", "work")], &[], &sessions(&["work"]), NOW + 500);
+
+        assert!(!changed, "the surviving pane must not revive the row");
+        assert_eq!(
+            only_agent(&tracker, "work").liveness,
+            Some(AgentLiveness::Exited)
+        );
+        assert!(
+            !tracker.apply_registry(vec![], NOW + 1_000),
+            "nothing new to report"
+        );
         assert!(tracker.prune(NOW + EXITED_PRUNE_MS + 1));
         assert!(tracker.get_agents("work").is_empty());
     }

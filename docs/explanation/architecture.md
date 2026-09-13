@@ -43,9 +43,12 @@ Watchers and external integrations do not know about the TUI. They only emit `Ag
 The `AgentTracker` is where those raw events become UI-friendly state:
 
 - it keeps instances separate with `threadId` when available
+- it binds rows to panes — explicitly from a Claude Code registry record or an event's `paneId`, heuristically only for an unambiguous agent-looking pane — and observes pane liveness from one `list-panes` pass per sync
 - it derives the most important session-level state from all instances
-- it tracks unseen status per instance for terminal states
-- it prunes stale or no-longer-relevant state over time
+- it tracks unseen status per instance for terminal states and clears it from what attached tmux clients are actually looking at
+- it prunes rows whose pane or process is gone, and times out rows that never had one
+
+Claude Code is special-cased at the source: its session registry (`~/.claude/sessions/<pid>.json`) is the ground truth for identity, pane and status, and the transcript only adds names, prompts and the running/done sub-state.
 
 This separation is why the built-in watchers can be simple and agent-specific while the unseen logic stays consistent across agents.
 

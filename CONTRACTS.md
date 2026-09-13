@@ -17,15 +17,16 @@ The Rust server scans these agent data sources directly:
 
 ### Claude Code
 
-- Reads JSONL transcripts in `~/.claude/projects/<encoded-path>/*.jsonl`, plus `$CLAUDE_CONFIG_DIR/projects/` and every `~/.claude*/projects/` sibling directory (multi-account setups).
-- Decodes project directories from folder names such as `-Users-me-project`.
-- Treats recent tool-use silence as `waiting` and long silence as `stale`.
+- Primary source: the session registry Claude Code (2.1.x and later) keeps at `<config>/sessions/<pid>.json` for every interactive process, polled every 500 ms. A record names the session id, the tmux pane the process started in, the `/rename` name, and a status that mirrors Claude's own status line: `busy` (turn in flight, or background subagents/workflows/teammates still running), `idle`, `waiting` (a permission prompt, question, plan approval or elicitation is open; the reason is shown as the row's `detail`), or `shell` (at the prompt with a background shell command running, shown as `done (shell running)`).
+- A record belongs to this server only when one of its panes' processes is an ancestor of the record's pid; pane ids alone are never trusted because every tmux server numbers panes from `%0`. Records of sessions outside this tmux server are ignored, and their transcripts are never attributed by directory either.
+- Transcripts (`<config>/projects/<encoded-path>/<session id>.jsonl`) are read incrementally and only enrich registry rows: custom title and last prompt for display, `tool-running` while the last assistant entry is an unanswered tool call, `delegating` while the registry is busy after the assistant's own turn ended, and `interrupted`/`error` for a turn that ended that way. Transcripts of sessions with no registry record (older Claude versions, `claude -p`) fall back to the old inference: status from the last entry, tool-use silence as `waiting`, long silence as `stale`, session from the entries' `cwd`.
+- Config directories: `~/.claude`, `$CLAUDE_CONFIG_DIR`, and every `~/.claude*` sibling holding Claude state (multi-account setups).
 
 ### Codex
 
-- Reads transcript JSONL files in `~/.codex/sessions/**/*.jsonl` or `$CODEX_HOME/sessions/**/*.jsonl`.
-- Reads `$CODEX_HOME/session_index.jsonl` for recent thread titles when available.
-- Resolves sessions from transcript `turn_context.cwd`.
+- Reads transcript JSONL files in `~/.codex/sessions/**/*.jsonl` or `$CODEX_HOME/sessions/**/*.jsonl`, incrementally.
+- Reads `$CODEX_HOME/session_index.jsonl` for recent thread titles when available; otherwise the title is the user's request after the last `## My request for Codex:` marker (injected IDE context is never a title).
+- Resolves sessions from transcript `turn_context.cwd`; rollouts of Codex's own subagents are ignored.
 
 ### OpenCode
 
@@ -63,14 +64,15 @@ curl -sS -X POST "$(sh ~/.tmux/plugins/opensessions/integrations/tmux-plugin/scr
 
 ### Session Resolution
 
-The server resolves the target session from either:
+The server resolves the target session, in this order:
 
-| Input field | Meaning |
+| Input | Meaning |
 | --- | --- |
+| a bound pane | Once a row is bound to a pane (`paneId`, or a Claude Code registry record), it lives in that pane's session and follows the pane if it is moved |
+| `projectDir` | Project/worktree directory: an exact session-dir match wins, then sessions rooted below it together with the sessions of the deepest ancestor directory. A tie between several sessions is settled by the one session that shows a live pane running that agent; otherwise the event is not attributed |
 | `tmuxSession` | Exact tmux session name |
-| `projectDir` | Project/worktree directory; exact session-dir match wins, then parent/child prefix matching |
 
-If neither field resolves to a session known to this server, the event is ignored with `202 Accepted` (not an error), so an integration can broadcast one event to every opensessions server on the machine and let each decide ownership. Malformed events get `400 Bad Request`.
+If nothing resolves to a session known to this server, the event is ignored with `202 Accepted` (not an error), so an integration can broadcast one event to every opensessions server on the machine and let each decide ownership. Malformed events get `400 Bad Request`.
 
 ## Agent Model
 
@@ -104,10 +106,11 @@ interface AgentEvent {
   unseen?: boolean;
   paneId?: string;
   liveness?: "alive" | "exited" | "unknown";
+  detail?: string;
 }
 ```
 
-External `/api/agent-event` callers send the same shape except they use `tmuxSession` or `projectDir` for session resolution. The serialized server state always contains the resolved `session` field.
+External `/api/agent-event` callers send the same shape except they use `tmuxSession` or `projectDir` for session resolution. The serialized server state always contains the resolved `session` field. `unseen`, `liveness` and `detail` are derived by the server and ignored when a client sends them.
 
 | Field | Type | Required for HTTP | Notes |
 | --- | --- | --- | --- |
@@ -119,16 +122,16 @@ External `/api/agent-event` callers send the same shape except they use `tmuxSes
 | `threadId` | `string` | no | Stable instance key for multiple threads in one session |
 | `threadName` | `string` | no | Human-readable label shown in the detail panel |
 | `lastUserPrompt` | `string` | no | Latest user prompt/intent, shown in agent detail UI |
-| `paneId` | `string` | no | tmux pane id used for focus/kill routing when available |
+| `paneId` | `string` | no | tmux pane the agent runs in. Binds the row to that pane: focus/kill go there, the row stays alive exactly as long as the pane exists, and it is reaped about 10 seconds after the pane disappears |
 
 ### Tracker Semantics
 
-- Instances are keyed by `agent:threadId` when `threadId` exists, otherwise by `agent`.
-- A session can have multiple active agent instances.
-- Unseen state is tracked per instance, then derived to the session level.
-- Non-terminal updates clear unseen state for that instance.
-- Terminal instances become seen when the user focuses the associated pane/session according to the server's tmux focus tracking.
-- Terminal instances are pruned automatically: about 10 seconds after their pane is observed gone, otherwise after 5 minutes once seen or 30 minutes while unseen. Running instances with no live pane are dropped after 30 minutes of silence. The websocket `dismiss-agent` command removes one immediately; a Pi runtime `delete` also removes that Pi thread.
+- Instances are keyed by `agent:threadId` when `threadId` exists, otherwise by `agent`. For Claude Code the `threadId` is the session id.
+- A session can have multiple active agent instances. A live Claude Code session is a row even while idle (`✓ idle`), so the sidebar is a map of agent panes: `Enter` focuses the pane, `x` kills it.
+- Pane bindings are explicit (a registry record or `paneId`) or, for agents without either, heuristic: an agent-looking pane (process name or title) is bound to a pane-less row of that agent only when the match is unambiguous — one free pane and one candidate in the session — and a binding is never moved while its pane still exists. Panes bind rows; they never author status.
+- Unseen state is tracked per instance, then derived to the session level. A row becomes unseen when it enters a terminal state (`done`, `error`, `interrupted`, `stale`). Non-terminal updates clear it.
+- Seen rule: a terminal row is seen as soon as its pane is the active pane of an attached tmux client — computed from tmux on every sync, never remembered — or when the user opens it with `Enter`, or when the session is marked seen. Finishing in a pane that is not on screen keeps the marker until the user looks.
+- Pruning: a row whose pane or process is gone is removed about 10 seconds later whatever its status. Rows that never had a pane keep the timeouts: terminal rows after 5 minutes once seen or 30 minutes while unseen, other rows after 30 minutes of silence. Rows bound to a live pane are never pruned. The websocket `dismiss-agent` command removes one immediately; a Pi runtime `delete` also removes that Pi thread.
 
 ## Metadata HTTP API
 

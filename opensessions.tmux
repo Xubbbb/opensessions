@@ -17,6 +17,7 @@
 #   @opensessions-prefix-key        "o"  — prefix + key to enter opensessions command table
 #   @opensessions-focus-global-key  ""   — optional no-prefix key to reveal and focus sidebar
 #   @opensessions-index-keys        ""   — optional no-prefix keys mapped to visible sessions 1..9
+#   @opensessions-direct-bindings   "on" — "off" skips the prefix C-s / C-t / M-1..9 bindings
 #   @opensessions-width             deprecated — use config.json sidebarWidth or the in-sidebar width slider
 
 CURRENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -47,6 +48,7 @@ get_option() {
 PREFIX_KEY=$(get_option "@opensessions-prefix-key" "o")
 FOCUS_GLOBAL_KEY=$(get_option "@opensessions-focus-global-key" "")
 INDEX_KEYS=$(get_option "@opensessions-index-keys" "")
+DIRECT_BINDINGS=$(get_option "@opensessions-direct-bindings" "on")
 COMMAND_TABLE="opensessions"
 
 bind_global_key() {
@@ -114,11 +116,14 @@ fi
 # Direct prefix bindings for programmatic use (terminal emulator shortcuts).
 # C-s/C-t are single-byte Ctrl codes; M-1..9 are 2-byte Alt sequences.
 # Both are safe to send as text from terminal emulators without timing issues.
-tmux bind-key C-s run-shell "sh '$SCRIPTS_DIR/focus.sh'"
-tmux bind-key C-t run-shell "sh '$SCRIPTS_DIR/toggle.sh'"
-for i in 1 2 3 4 5 6 7 8 9; do
-  tmux bind-key "M-$i" run-shell "sh '$SCRIPTS_DIR/switch-index.sh' $i"
-done
+# They shadow tmux's own prefix M-1..M-5 layout keys, so they can be turned off.
+if [ "$DIRECT_BINDINGS" != "off" ]; then
+  tmux bind-key C-s run-shell "sh '$SCRIPTS_DIR/focus.sh'"
+  tmux bind-key C-t run-shell "sh '$SCRIPTS_DIR/toggle.sh'"
+  for i in 1 2 3 4 5 6 7 8 9; do
+    tmux bind-key "M-$i" run-shell "sh '$SCRIPTS_DIR/switch-index.sh' $i"
+  done
+fi
 
 bind_global_key "$FOCUS_GLOBAL_KEY" "sh '$SCRIPTS_DIR/focus.sh'"
 bind_global_index_keys

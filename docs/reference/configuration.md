@@ -84,6 +84,7 @@ The tmux integration reads these tmux options instead of `config.json`:
 | `@opensessions-prefix-key` | `o` | Key after the tmux prefix that enters the opensessions key table (`prefix <key>`) |
 | `@opensessions-focus-global-key` | unset | Optional no-prefix tmux keybinding that reveals and focuses the sidebar pane |
 | `@opensessions-index-keys` | unset | Optional space-separated no-prefix tmux keys mapped in order to visible sessions `1` through `9` |
+| `@opensessions-direct-bindings` | `on` | Set to `off` to skip the direct `prefix C-s` / `prefix C-t` / `prefix M-1`…`M-9` bindings below (they shadow tmux's `M-1`…`M-5` layout keys and tmux-resurrect's `prefix C-s`) |
 | `@opensessions-width` | deprecated | Use `sidebarWidth` in config or the in-sidebar width slider instead |
 
 The plugin registers these prefix bindings automatically:
@@ -94,6 +95,9 @@ The plugin registers these prefix bindings automatically:
 | `prefix o → t` | Toggle the sidebar |
 | `prefix o → e` | Spread non-sidebar panes in the current window using `even-horizontal` |
 | `prefix o → 1` through `prefix o → 9` | Switch to visible session by index |
+| `prefix C-s` | Reveal and focus the sidebar (direct binding, see `@opensessions-direct-bindings`) |
+| `prefix C-t` | Toggle the sidebar (direct binding) |
+| `prefix M-1` through `prefix M-9` | Switch to visible session by index (direct bindings; note tmux itself binds `M-1`…`M-5` to layouts) |
 
 Minimal install:
 

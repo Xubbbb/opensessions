@@ -41,7 +41,7 @@ opensessions/
 
 1. **Rust-first runtime**: the supported server and TUI are Rust crates in `apps/*-rs` and `packages/*-rs`.
 2. **Ratatui sidebar**: rendering is immediate-mode Ratatui/Crossterm. Shared UI logic lives in `packages/sidebar-core-rs` so renderer, input, tests, and E2E flows use one source of truth.
-3. **Built-in agent watchers**: the Rust server scans Amp, Claude Code, Codex, OpenCode, Pi, and Droid state directly and converts it into `AgentEvent`s.
+3. **Built-in agent watchers**: the Rust server scans Amp, Claude Code, Codex, OpenCode, Pi, and Droid state directly and converts it into `AgentEvent`s. For Claude Code the source of truth is its session registry (`<config>/sessions/<pid>.json`: session id, pane, status, name — see `packages/runtime-rs/src/claude_registry.rs`); transcripts only enrich registry rows and are the fallback for sessions without a record.
 4. **External agent events via HTTP**: third-party agents should POST to `/api/agent-event` or use the metadata endpoints. TypeScript plugin loading is not a supported runtime path right now.
 5. **Tmux is the supported mux**: abstractions remain mux-shaped, but tmux is the only documented supported provider. Older zellij helper code is not part of the support promise.
 6. **Release binaries, not local builds**: TPM users get prebuilt `opensessions-sidebar`, `opensessions-server`, and `lazydiff` binaries in `bin/`. `cargo build --release` is for development or unsupported platforms.
@@ -64,7 +64,8 @@ opensessions/
   lastUserPrompt?: string,
   unseen?: boolean,
   paneId?: string,
-  liveness?: "alive" | "exited" | "unknown"
+  liveness?: "alive" | "exited" | "unknown",
+  detail?: string
 }
 ```
 
@@ -97,8 +98,9 @@ The Rust trait lives in `packages/runtime-rs/src/mux.rs`. Keep methods synchrono
 - **Preserve optimizations**: batched tmux calls, git cache with HEAD watchers, lightweight focus-only broadcasts, fixed-width sidebar repair, and per-client focus state.
 - **Sidebar resize work**: before changing sidebar spawning, width sync, tmux resize handling, or `sidebar-coordinator`, read `docs/explanation/sidebar-behavior.md` and preserve those invariants unless you update the doc in the same change.
 - **Built-in watchers in Rust runtime/server**: Amp, Claude Code, Codex, OpenCode, Pi, and Droid watcher parsing lives in `packages/runtime-rs/src/agent_watchers.rs` and server scanning lives in `apps/server-rs/src/lib.rs`.
-- **Do not reintroduce pane-derived agent status**: panes can help focus/kill/routing, but watcher/API events are the source of agent status.
-- **Agent pruning runs in `snapshot_json`**: `AgentTracker::prune_terminal`/`prune_stuck` reap finished or abandoned agents (see the TTL constants in `tracker.rs`); keep them called on every snapshot.
+- **Do not reintroduce pane-derived agent status**: panes can bind rows (explicitly through a registry record or `paneId`, heuristically only on an unambiguous 1:1 match) and drive focus/kill/seen, but the registry, watcher and API events are the source of agent status. Never guess Claude Code state from a transcript when a registry record exists.
+- **Agent sync runs in `snapshot_json`**: `ReadOnlyMuxStateSource::sync_agents` lists every pane and every client's current pane once, reconciles liveness, bindings and the seen rule (`AgentTracker::sync_panes`), then reaps gone or abandoned rows (`AgentTracker::prune`; TTL constants in `tracker.rs`). Keep it on every snapshot and keep it to those two tmux calls.
+- **Transcripts are read incrementally**: `transcript_tail::TailCache` parses only appended lines; a parser that needs the whole file again must reset its state rather than re-read from disk.
 
 ## Common Commands
 
@@ -123,7 +125,7 @@ The tmux E2E suite starts private tmux servers (`tmux -L opensessions-e2e-*`) an
 
 ## Adding Agent Support
 
-1. Prefer an external HTTP integration first: POST `/api/agent-event` with stable `agent`, `threadId`, `projectDir` or `tmuxSession`, and `status`.
+1. Prefer an external HTTP integration first: POST `/api/agent-event` with stable `agent`, `threadId`, `projectDir` or `tmuxSession`, `status`, and `paneId` whenever the integration runs inside tmux (`$TMUX_PANE`), so the row is bound to its pane explicitly.
 2. For built-in support, add parser/scanner logic in Rust and tests in `packages/runtime-rs` or `apps/server-rs`.
 3. Preserve per-thread unseen semantics and pane focus clearing.
 4. See `CONTRACTS.md` for integration examples.

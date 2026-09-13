@@ -94,12 +94,18 @@ for i in 1 2 3 4 5 6 7 8 9; do
 done
 tmux unbind-key -T opensessions Any 2>/dev/null || true
 
-# Direct prefix bindings
+# Direct prefix bindings, then tmux's own defaults for the keys they shadowed
+# (prefix M-1..M-5 select layouts) so they work again without a tmux restart.
 tmux unbind-key C-s 2>/dev/null || true
 tmux unbind-key C-t 2>/dev/null || true
 for i in 1 2 3 4 5 6 7 8 9; do
   tmux unbind-key "M-$i" 2>/dev/null || true
 done
+tmux bind-key M-1 select-layout even-horizontal 2>/dev/null || true
+tmux bind-key M-2 select-layout even-vertical 2>/dev/null || true
+tmux bind-key M-3 select-layout main-horizontal 2>/dev/null || true
+tmux bind-key M-4 select-layout main-vertical 2>/dev/null || true
+tmux bind-key M-5 select-layout tiled 2>/dev/null || true
 
 # Global keys (if configured)
 FOCUS_GLOBAL_KEY=$(tmux show-option -gqv "@opensessions-focus-global-key" 2>/dev/null)

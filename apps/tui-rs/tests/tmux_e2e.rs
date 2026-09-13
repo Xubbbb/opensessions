@@ -519,6 +519,51 @@ fn tmux_sidebar_drops_claude_registry_rows_whose_pane_or_process_is_gone() {
         !text.contains("long job")
     });
     record.remove();
+
+    // `/exit`: the process is gone and Claude Code removed its record, but
+    // the pane lives on at a shell prompt and the transcript is still fresh.
+    // Neither may keep or resurrect the row.
+    let survivor_pane = lab.spawn_agent_pane("opensessions", "claude");
+    let record =
+        lab.write_claude_registry_record(&survivor_pane, "sess-2", "busy", None, "exiting");
+    lab.wait_for_capture_pane(&sidebar, |text| {
+        text.lines().any(|line| line.contains("exiting"))
+    });
+    let encoded = lab
+        .root
+        .join("opensessions")
+        .to_string_lossy()
+        .chars()
+        .map(|ch| {
+            if matches!(ch, '/' | '.' | '_') {
+                '-'
+            } else {
+                ch
+            }
+        })
+        .collect::<String>();
+    let transcript_dir = lab.home_dir().join(".claude/projects").join(encoded);
+    fs::create_dir_all(&transcript_dir).expect("transcript dir");
+    let cwd = lab.root.join("opensessions").to_string_lossy().to_string();
+    fs::write(
+        transcript_dir.join("sess-2.jsonl"),
+        format!(
+            "{}\n{}\n",
+            serde_json::json!({"type":"user","sessionId":"sess-2","cwd":cwd,"message":{"role":"user","content":"finish up"}}),
+            serde_json::json!({"type":"assistant","sessionId":"sess-2","cwd":cwd,"message":{"role":"assistant","content":[{"type":"text","text":"bye"}],"stop_reason":"end_turn"}}),
+        ),
+    )
+    .expect("write transcript");
+    record.remove();
+    lab.wait_for_capture_pane_within(&sidebar, Duration::from_secs(20), |text| {
+        !text.contains("exiting")
+    });
+    sleep(Duration::from_secs(5));
+    let capture = lab.capture_pane(&sidebar);
+    assert!(
+        !capture.contains("exiting") && !capture.contains("finish up"),
+        "an exited session must not come back through its transcript:\n{capture}"
+    );
 }
 
 #[test]

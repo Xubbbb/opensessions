@@ -390,6 +390,10 @@ pub struct ReadOnlyMuxStateSource {
     foreign_claude_sessions: Mutex<HashSet<String>>,
     /// Live Claude Code sessions of this mux, for transcript enrichment.
     claude_registry_threads: Mutex<Vec<RegistryThread>>,
+    /// Claude Code sessions whose process exited recently (session id ->
+    /// when). Their transcripts stay recent for a while and must not come
+    /// back as pane-less rows through the fallback watcher.
+    claude_retired_sessions: Mutex<HashMap<String, u64>>,
     pi_runtime_registry: Mutex<PiRuntimeRegistry>,
     now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
@@ -468,6 +472,7 @@ impl ReadOnlyMuxStateSource {
             registry_resolver: Mutex::new(RegistryResolver::new()),
             foreign_claude_sessions: Mutex::new(HashSet::new()),
             claude_registry_threads: Mutex::new(Vec::new()),
+            claude_retired_sessions: Mutex::new(HashMap::new()),
             pi_runtime_registry: Mutex::new(PiRuntimeRegistry::with_default_ttl()),
             now_ms: Arc::new(current_time_ms),
         }
@@ -667,9 +672,28 @@ impl ReadOnlyMuxStateSource {
                 agent_name: record.agent,
             });
         }
-        *self.foreign_claude_sessions.lock().unwrap() = foreign;
-        *self.claude_registry_threads.lock().unwrap() = threads;
         let now = (self.now_ms)();
+        *self.foreign_claude_sessions.lock().unwrap() = foreign;
+        {
+            let live = threads
+                .iter()
+                .map(|thread| thread.session_id.as_str())
+                .collect::<HashSet<_>>();
+            let previous = std::mem::replace(
+                &mut *self.claude_registry_threads.lock().unwrap(),
+                threads.clone(),
+            );
+            let mut retired = self.claude_retired_sessions.lock().unwrap();
+            for thread in previous {
+                if !live.contains(thread.session_id.as_str()) {
+                    retired.insert(thread.session_id, now);
+                }
+            }
+            retired.retain(|session_id, retired_at| {
+                !live.contains(session_id.as_str())
+                    && now.saturating_sub(*retired_at) <= AGENT_WATCHER_RECENT_MS
+            });
+        }
         let changed = self
             .agent_tracker
             .lock()
@@ -1377,10 +1401,15 @@ impl ReadOnlyMuxStateSource {
                     .lock()
                     .unwrap()
                     .contains(thread_id)
+                    || self
+                        .claude_retired_sessions
+                        .lock()
+                        .unwrap()
+                        .contains_key(thread_id)
             })
         {
             debug_log(format!(
-                "watcher-snapshot skipped foreign claude session thread_id={:?}",
+                "watcher-snapshot skipped foreign or exited claude session thread_id={:?}",
                 snapshot.thread_id,
             ));
             return false;

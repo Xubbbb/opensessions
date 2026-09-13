@@ -1,12 +1,12 @@
 # Audit findings (2026-09-12)
 
-Generated from the 53-agent bug audit (10 area finders, 43 skeptical verifiers). Every row was confirmed by a verifier that tried to refute it; severities are the verifier's. Status: `fixed` = addressed in the working tree on 2026-09-13; `agent redesign` = belongs to the agent-identification pipeline and is deferred to that redesign (see `agent-redesign-handoff.md`); `open` = still to do. Classification `unclear` = a product decision for the maintainer.
+Generated from the 53-agent bug audit (10 area finders, 43 skeptical verifiers). Every row was confirmed by a verifier that tried to refute it; severities are the verifier's. Status: `fixed` = addressed on 2026-09-13 (`(agent redesign)` marks the ones closed by the registry-first agent pipeline, see `agent-redesign-handoff.md`); `open` = still to do. Classification `unclear` = a product decision for the maintainer.
 
 ## High (6)
 
 - **F079** `.github/workflows/release.yml:13` — high · bug · _fixed 2026-09-13_  
   release.yml pins LAZYDIFF_REF v0.1.0-alpha.18 on Xubbbb/lazydiff, which carries no tags: every release build leg fails at 'Checkout lazydiff', so the fork can never publish a release and fresh TPM installs of the fork 404 on binary download
-- **F013** `apps/server-rs/src/lib.rs:569` — high · bug · _agent redesign_  
+- **F013** `apps/server-rs/src/lib.rs:569` — high · bug · _fixed 2026-09-13 (agent redesign)_  
   Last-focused pane of a background session is treated as still on screen, so agents finishing there are marked seen immediately and never show the unseen marker  
   Fix: Only treat a pane as seen while a client is actually looking at it. Minimal version consistent with the existing single-client focus tracking: in `remember_focused_pane` and `sync_agent_pane_presence`, drop entries for every session other than the one the client just reported (`focused_pane_by_session.retain(|s, _| s == &context.session)` before the insert), so `mark_focused_agent_panes_seen`, `apply_agent_event` and `apply_agent_watcher_snapshot` only see the current session's pane. Cleaner ver
 - **F080** `opensessions.tmux:79` — high · bug · _fixed 2026-09-13_  
@@ -15,7 +15,7 @@ Generated from the 53-agent bug audit (10 area finders, 43 skeptical verifiers).
   list-panes -s -t <session_name> / display-message -t <session_name> resolve a bare name as a window of the *current* session first, so per-session pane queries return another session's panes
 - **F022** `packages/runtime-rs/src/tmux_provider.rs:566` — high · bug · _fixed 2026-09-13_  
   after-resize-pane width-repair hook re-triggers itself indefinitely whenever the sidebar cannot reach @opensessions_width (stacked/zoomed layouts) - sustained fork storm on the tmux server
-- **F036** `packages/runtime-rs/src/tracker.rs:568` — high · bug · _agent redesign_  
+- **F036** `packages/runtime-rs/src/tracker.rs:568` — high · bug · _fixed 2026-09-13 (agent redesign)_  
   Single-entry pane attachment re-stamps the entry on every pane of that agent (last listed pane wins) and is never re-evaluated when a second entry appears, so kill/focus/seen route to the wrong thread and a restarted conversation in the same pane is never attached  
   Fix: In the thread-id-less fallback (tracker.rs:568-595): count the panes of that agent in this presence batch and only auto-attach when there is exactly one pane and exactly one candidate entry (otherwise leave pane_id untouched); never restamp an entry that is already Alive on another pane still present in the batch. When several entries exist for an agent with a single pane, attach the pane to the most recent non-terminal entry (max ts, preferring Running/ToolRunning/Waiting) and clear pane_id/liv
 
@@ -60,15 +60,15 @@ Generated from the 53-agent bug audit (10 area finders, 43 skeptical verifiers).
   remain-on-exit is never switched back off for windows that hosted a sidebar: both uninstall.sh and the server's cleanup look for sidebar panes only after those panes were killed
 - **F086** `opensessions.tmux:81` — medium · bug · _fixed 2026-09-13_  
   Update-restart in opensessions.tmux blindly SIGTERMs whatever pid is in the pid file: a stale pid leaves the old server running (README promise broken) and a recycled pid kills an unrelated process
-- **F039** `packages/runtime-rs/src/agent_watchers.rs:416` — medium · bug · _agent redesign_  
+- **F039** `packages/runtime-rs/src/agent_watchers.rs:416` — medium · bug · _fixed 2026-09-13 (agent redesign)_  
   Claude Code project-dir decoding trusts the dash->slash guess whenever that path exists and the encoded fallback is exact-match only, so transcripts are misattributed on name collisions and never resolved for subdirectory launches under dashed/underscored/dotted session dirs; the per-entry cwd is ignored  
   Fix: In claude_code_snapshot_from_jsonl take project_dir from the first entry with a non-empty string `cwd` (every user/assistant entry has one) and use the decoded folder name only as a fallback. In the fallback path, check for an exact encoded match against known session dirs before trusting the naive slash path, and apply parent/child matching on the encoded form (e.g. `encoded.starts_with(&format!("{}-", encode(session.dir)))`), routing `__encoded__` values through resolve_session_for_project_dir
-- **F041** `packages/runtime-rs/src/agent_watchers.rs:521` — medium · bug · _agent redesign_  
+- **F041** `packages/runtime-rs/src/agent_watchers.rs:521` — medium · bug · _fixed 2026-09-13 (agent redesign)_  
   Codex parser turns injected user items (<recommended_plugins>, <skill>, '# Context from my IDE setup:' blobs, guardian-subagent assessment prompts) into thread titles and last prompts; the event_msg '<' filter is bypassed by the prompt fallback  
   Fix: Do the rejection in one place: in normalize_codex_user_prompt, locate the *last* `## My request for Codex:` marker with rfind and keep only the text after it; then reject candidates that start with '<' or '{' or '# Context from my IDE' or '# Files mentioned by the user:' or '# AGENTS.md' (this also fixes the fallback at lines 144-147 and makes the event_msg check redundant). Separately skip rollouts whose first session_meta has `payload.source.subagent` or `payload.thread_source` in {"subagent",
 - **F017** `packages/runtime-rs/src/agent_watchers.rs:753` — medium · bug · _fixed 2026-09-13_  
   find_uuid_suffix slices by byte offset: a non-ASCII .jsonl name (>= 36 bytes) under ~/.codex/sessions panics the scan; release profile (panic=abort) turns it into a server abort on the first 2 s tick
-- **F016** `packages/runtime-rs/src/project_dir_session.rs:35` — medium · bug · _agent redesign_  
+- **F016** `packages/runtime-rs/src/project_dir_session.rs:35` — medium · bug · _fixed 2026-09-13 (agent redesign)_  
   A session at an ancestor directory (e.g. $HOME) makes an agent under a deeper session's dir unresolvable: nested ancestor matches are treated as ambiguous instead of deepest-wins  
   Fix: In resolve_session_for_project_dir, rank ancestors by depth so the longest prefix wins instead of pooling all ancestors: partition related dirs into ancestors (project_dir.starts_with("{dir}/")) and descendants (dir.starts_with("{project_dir}/")); keep only the deepest ancestor dir's sessions (e.g. `let mut deepest: Option<(&String,&Vec<String>)>; if deepest.is_none_or(|(d,_)| dir.len() > d.len()) { deepest = Some((dir, sessions)) }`), then related_matches = descendants ∪ deepest-ancestor sessio
 - **F103** `packages/runtime-rs/src/session_order.rs:45` — medium · bug · _open_  
@@ -86,16 +86,16 @@ Generated from the 53-agent bug audit (10 area finders, 43 skeptical verifiers).
   Session names are expanded unescaped inside the single-quoted `-d '...'` hook body: an apostrophe silently disables the focus/ensure-sidebar hooks for that session and `'; cmd; '` executes cmd in tmux's run-shell
 - **F023** `packages/runtime-rs/src/tmux_scripting.rs:268` — medium · bug · _fixed 2026-09-13_  
   pane-died hook's final sweep kills every dead pane on the tmux server, including panes in windows/sessions where the user (not opensessions) enabled remain-on-exit
-- **F038** `packages/runtime-rs/src/tracker.rs:204` — medium · bug · _agent redesign_  
+- **F038** `packages/runtime-rs/src/tracker.rs:204` — medium · bug · _fixed 2026-09-13 (agent redesign)_  
   Waiting and Idle entries are excluded from both prune rules, so an HTTP-posted waiting/idle agent whose pane closes (e.g. Amp's session-start 'idle') is shown forever  
   Fix: In prune_terminal (or a new prune_exited rule run from prune_agents) apply the exited_at branch to every non-Alive entry regardless of status before the is_terminal_status check, so any entry whose pane has been gone for EXITED_PRUNE_MS is reaped; and extend prune_stuck's status match to include Waiting and Idle so silent pane-less waiting/idle entries fall under the 30-minute STUCK_PRUNE_MS TTL.
-- **F035** `packages/runtime-rs/src/tracker.rs:443` — medium · bug · _agent redesign_  
+- **F035** `packages/runtime-rs/src/tracker.rs:443` — medium · bug · _fixed 2026-09-13 (agent redesign)_  
   Presence sync equates 'pane not detected as an agent pane' with 'pane gone': a documented custom-integration paneId is erased in the response to the event itself, and (new in this pass) its terminal entries are reaped ~10 s later while the pane is alive  
   Fix: Give the tracker the full set of live pane ids of the session, not just detected agent panes: add a provider method (e.g. list_pane_ids(session) built from list_panes(PaneScope::Session)) and pass it as a second argument to apply_pane_presence; use that set (unioned with the agent-pane ids) for the Exited check at tracker.rs:454-458 while keeping the agent-pane list for attachment. Treat a failed/empty tmux listing (non-zero exit_code in run()) as 'unknown' and skip the downgrade for that sync.
-- **F110** `packages/runtime-rs/src/tracker.rs:454` — medium · bug · _agent redesign_  
+- **F110** `packages/runtime-rs/src/tracker.rs:454` — medium · bug · _fixed 2026-09-13 (agent redesign)_  
   Custom (non-alias) HTTP agents lose paneId on the first snapshot and their done/error markers are reaped after ~10 s because pane presence only recognises AGENT_ALIASES panes  
   Fix: Make liveness depend on whether the tracked pane still exists rather than on alias recognition: in sync_agent_pane_presence also collect the session's full live pane-id set (provider.list_panes / a small new MuxProvider method) and pass it to apply_pane_presence, which should only flip an Alive entry to Exited when event.pane_id is absent from that full set (alias-recognised panes keep driving attachment/re-attachment). Alternatively have list_agent_panes include any pane whose id is in tracker.
-- **F037** `packages/runtime-rs/src/tracker.rs:703` — medium · bug · _agent redesign_  
+- **F037** `packages/runtime-rs/src/tracker.rs:703` — medium · bug · _fixed 2026-09-13 (agent redesign)_  
   Every applied event unconditionally clears exited_at, so watcher-derived same-ts Waiting/Stale flips and the /exit Done cancel the documented 10-second reap; killed or exited Claude Code entries linger up to 30 minutes  
   Fix: At tracker.rs:700-703 only clear exited_at when the event demonstrates the agent is back: it carries pane_id/liveness Alive, or its status is non-terminal and its ts is strictly newer than the previously stored event's ts. Keep exited_at across terminal events and across watcher transitions whose ts did not advance. Consider also letting prune_terminal reap non-terminal entries via the exited_at rule (see F038) so a killed Running agent does not wait for the Stale flip.
 - **F050** `packages/sidebar-core-rs/src/app.rs:257` — medium · bug · _fixed 2026-09-13_  
@@ -136,13 +136,13 @@ Generated from the 53-agent bug audit (10 area finders, 43 skeptical verifiers).
 - **F095** `apps/server-rs/src/lib.rs:1052` — low · bug · _open_  
   Session metadata store is never pruned: status/progress/logs resurface on a re-created session name and the map grows per distinct name posted, contradicting the 'auto-pruned' API doc  
   Fix: In `visible_session_names()` (lib.rs:1690-1701) right after `session_order.sync(names.clone())` add `self.metadata_store.lock().unwrap().prune_sessions(names.iter().cloned());` - prune against ALL live session names (not the visible subset, so hidden sessions keep their metadata). Optionally reject metadata posts for unknown session names.
-- **F116** `apps/server-rs/src/lib.rs:1174` — low · unclear · _agent redesign_  
+- **F116** `apps/server-rs/src/lib.rs:1174` — low · unclear · _fixed 2026-09-13 (agent redesign)_  
   /api/agent-event trusts client `ts` for TTL pruning: a `ts` in seconds (contract says ms) makes the event reaped in the same request, silently (204), unless a recognised live pane shields it; the `liveness`/`unseen` part of the claim is refuted  
   Fix: Minimal hardening in apply_agent_event (lib.rs:1174-1177): treat implausible ts as invalid — e.g. `ts < 1_000_000_000_000` (before 2001 in ms, i.e. a seconds value) -> either multiply by 1000, fall back to (self.now_ms)(), or return a new AgentEventError::InvalidTimestamp mapped to 400 'ts must be milliseconds'. Optionally reword CONTRACTS.md:111 to say `unseen`/`liveness` are server-derived and ignored on the HTTP path (the field table already implies it).
-- **F020** `apps/server-rs/src/lib.rs:1289` — low · bug · _agent redesign_  
+- **F020** `apps/server-rs/src/lib.rs:1289` — low · bug · _fixed 2026-09-13 (agent redesign)_  
   Agent-watcher loop re-resolves every unresolved recent transcript each 2 s tick (4 tmux spawns each), broadcasts one full snapshot per applied snapshot, and never evicts last_seen (uncapped prompts)  
   Fix: In run_agent_watcher_loop: list sessions once per tick (spawn_blocking) and pass the Vec<MuxSessionInfo> into resolve/apply so a resolve costs 0 spawns; keep a second map of unresolved key->fingerprint (plus a hash of the (name,dir) session set) and skip re-resolving until either changes; apply all snapshots first and send a single snapshot_json() after the loop if anything was applied; at the end of each tick `last_seen.retain(|k,_| keys_seen_this_tick.contains(k))` (the scanner already drops e
-- **F010** `apps/server-rs/src/lib.rs:1303` — low · bug · _agent redesign_  
+- **F010** `apps/server-rs/src/lib.rs:1303` — low · bug · _fixed 2026-09-13 (agent redesign)_  
   Every unresolved (non-idle, <=5 min old) agent-watcher snapshot triggers two full provider.list_sessions() scans (4 tmux subprocesses with TmuxProvider) on every 2 s tick, inline on the current_thread runtime; the second scan is a regression from the uncommitted resolve_session_for_project_dir refactor  
   Fix: Compute the session list once and reuse it: change resolve_session_for_project_dir to take `&[MuxSessionInfo]` (or the built dir-session map) and pass the `sessions` already collected in resolve_agent_watcher_session; better, build the dir->session map once per watcher tick in run_agent_watcher_loop (before the `for snapshot in snapshots` loop) and pass it into apply_agent_watcher_snapshot so N unresolved snapshots cost one listing per tick instead of 2N.
 - **F011** `apps/server-rs/src/lib.rs:1473` — low · bug · _open_  
@@ -151,12 +151,12 @@ Generated from the 53-agent bug audit (10 area finders, 43 skeptical verifiers).
 - **F099** `apps/server-rs/src/lib.rs:1604` — low · bug · _open_  
   Config `sidebarPosition` is documented as active but both sidebar spawn sites hard-code SidebarPosition::Left; `mux` is documented as active but never consulted (no user-visible effect today)  
   Fix: Store the loaded position on ReadOnlyMuxStateSource (e.g. `sidebar_position: mux::SidebarPosition`, default Left) via a `with_sidebar_position` builder called from `default_state_source_from_env` (map config::SidebarPosition::{Left,Right} -> mux::SidebarPosition::{Left,Right}) and pass it at lib.rs:1604 and :1654. For `mux`, either pass `config.mux.as_deref()` into a MuxRegistry::resolve call or change the docs row (configuration.md:30, README.md:197) to 'parsed only'.
-- **F102** `apps/server-rs/src/lib.rs:1698` — low · unclear · _open_  
+- **F102** `apps/server-rs/src/lib.rs:1698` — low · unclear · _fixed 2026-09-13_  
   `d` on the attached (current) tmux session is a silent no-op: hide-session is undone by the per-snapshot session_order.show(current), with no client feedback  
   Fix: Pick one and document it: (a) client-side guard — in packages/sidebar-core-rs/src/app.rs:528-533 skip HideSession when the focused session equals my_session/current_session (optionally flash or show a one-line hint), and add 'the session you are attached to cannot be hidden' to docs/reference/features-and-keybindings.md:73; or (b) server-side — in the hide-session arm (lib.rs:798-802) return early when `name == provider.get_current_session()` so the intent is at least explicit, and/or only call 
 - **F019** `apps/server-rs/src/lib.rs:1959` — low · bug · _fixed 2026-09-13_  
   Docs still promise an Amp `session.json` seen-state integration that no longer exists (removed in the TS watcher rewrite d7a6287, never ported to Rust)
-- **F015** `apps/server-rs/src/lib.rs:2024` — low · bug · _agent redesign_  
+- **F015** `apps/server-rs/src/lib.rs:2024` — low · bug · _fixed 2026-09-13 (agent redesign)_  
   Agent watchers fully re-read and re-parse every recently modified transcript every 2 s even when unchanged (~75 ms CPU + 145 MB transient allocation per tick for the 145 MB transcript on this machine)  
   Fix: Keep a per-path cache keyed by (mtime, len) holding the parsed intermediate state (status, thread_name, last_user_prompt, last_entry_is_tool_use, saw_entry) and skip the read/parse when unchanged, recomputing only the mtime-dependent Waiting/Stale promotion from the cached fields; or, since the files are append-only, remember the last offset and parse only the appended tail (re-parse from scratch if len shrank).
 - **F012** `apps/server-rs/src/lib.rs:2596` — low · bug · _open_  
@@ -213,13 +213,13 @@ Generated from the 53-agent bug audit (10 area finders, 43 skeptical verifiers).
 - **F091** `integrations/tmux-plugin/scripts/uninstall.sh:19` — low · bug · _open_  
   uninstall.sh run outside tmux derives port 7391 and /tmp/opensessions.pid, so /quit misses the real server (22000+key) while the tmux sweep still strips hooks/panes/env from the default socket  
   Fix: In server-common.sh's server_key(), when $TMUX is unset fall back to `tmux display-message -p '#{socket_path}'` (empty if no server) before giving up, so PORT/PID_FILE match the server that the bare tmux commands are already targeting; additionally in uninstall.sh check `server_alive` before the /quit and after the sleep and print a warning (with the pid file path / `kill $(cat $PID_FILE)` hint) instead of the unconditional '✓ stopped server (if running)' when the server was reachable but did no
-- **F092** `opensessions.tmux:107` — low · unclear · _open_  
+- **F092** `opensessions.tmux:107` — low · unclear · _fixed 2026-09-13_  
   Direct prefix bindings C-s/C-t/M-1..9 are unconditional, shadow tmux's built-in M-1..M-5 layout keys and tmux-resurrect's prefix C-s, are absent from the configuration reference's binding table, and uninstall leaves the shadowed tmux defaults unbound until tmux restarts  
   Fix: If the maintainer wants to keep the defaults: list `prefix C-s`, `prefix C-t`, `prefix M-1..M-9` in the configuration.md binding table with a note that they shadow tmux's M-1..M-5 layout keys, and add an option (e.g. `@opensessions-direct-bindings on|off`) so users of tmux-resurrect or the layout keys can turn them off. In uninstall.sh, after unbinding, restore the tmux defaults for the keys it shadowed (`bind-key -T prefix o select-pane -t :.+`, `M-1 select-layout even-horizontal`, `M-2 even-ve
-- **F046** `packages/runtime-rs/src/agent_watchers.rs:297` — low · bug · _agent redesign_  
+- **F046** `packages/runtime-rs/src/agent_watchers.rs:297` — low · bug · _open (Droid out of scope for the agent redesign)_  
   Droid parser lets a per-line 'id' on any entry override the session id, so transcripts whose message lines carry ids get a new thread_id (and tracker instance) per message  
   Fix: Only accept `id` as the session id from a header line (`type == "session_start"` / `"session"`, or a line without `message`/`role`/`hook_event_name`), keep `session_id`/`sessionId` from hook lines, and never let a later line override an already-found session id (`if session_id_from_file.is_none()`). Also verify against a real Droid install whether transcripts live in ~/.factory/sessions rather than ~/.factory/projects and scan both if needed.
-- **F040** `packages/runtime-rs/src/agent_watchers.rs:467` — low · bug · _agent redesign_  
+- **F040** `packages/runtime-rs/src/agent_watchers.rs:467` — low · bug · _fixed 2026-09-13 (agent redesign)_  
   Claude Code parser treats isMeta and isCompactSummary user entries as real prompts: /context output or skill bodies become thread names / last prompts and compaction summaries become the last prompt  
   Fix: In extract_claude_user_prompt return None when `entry.get("isMeta") == Some(&Value::Bool(true))` or `entry.get("isCompactSummary") == Some(&Value::Bool(true))` (and skip them in determine_claude_code_status for consistency). Optionally prefer Claude Code's explicit entries: `type == "last-prompt"` -> `lastPrompt` for last_user_prompt, and `type == "ai-title"` -> `aiTitle` as a title source below `custom-title`.
 - **F097** `packages/runtime-rs/src/config.rs:52` — low · bug · _open_  
@@ -234,10 +234,10 @@ Generated from the 53-agent bug audit (10 area finders, 43 skeptical verifiers).
 - **F112** `packages/runtime-rs/src/metadata_store.rs:93` — low · bug · _open_  
   Metadata store is never pruned: deleted-session metadata resurfaces on a re-created same-named session and unknown session names accumulate forever, contrary to the documented auto-prune  
   Fix: Wire the existing pruner into the snapshot path using the FULL tmux listing (not `visible_session_names`, whose `SessionOrder::apply` drops hidden sessions, which would delete metadata of merely-hidden sessions). Minimal patch in apps/server-rs/src/lib.rs `visible_session_names` (line 1689), right after `let names = self.sorted_session_names();`: `self.metadata_store.lock().unwrap().prune_sessions(names.iter().cloned());`. This mirrors how `session_order.sync(names.clone())` already reconciles p
-- **F047** `packages/runtime-rs/src/pi_runtime_registry.rs:36` — low · bug · _agent redesign_  
+- **F047** `packages/runtime-rs/src/pi_runtime_registry.rs:36` — low · bug · _fixed 2026-09-13 (agent redesign)_  
   Pi runtime registry TTL is never enforced: the server only calls upsert/delete, so entries from pi processes that exit without a delete accumulate (~300 B each) for the server's lifetime  
   Fix: Wire the existing prune into the periodic path: in prune_agents (apps/server-rs/src/lib.rs:555) add `self.pi_runtime_registry.lock().unwrap().prune(now);` (optionally fold its bool into `changed` is unnecessary since the registry is not part of the snapshot). snapshot_json already calls prune_agents on every poll tick, so heartbeating pi processes (5 s cadence) stay registered while dead ones expire after 20 s, matching the heartbeat/TTL design; delete remains a plain remove so a genuine session
-- **F118** `packages/runtime-rs/src/project_dir_session.rs:58` — low · unclear · _agent redesign_  
+- **F118** `packages/runtime-rs/src/project_dir_session.rs:58` — low · unclear · _fixed 2026-09-13 (agent redesign)_  
   Two sessions rooted at the same directory make every projectDir-only agent (all transcript watchers) unresolvable; ambiguity rule is deliberate but undocumented  
   Fix: At minimum document the rule in CONTRACTS.md (Session Resolution): 'if more than one session matches at the winning stage, the event is not attributed (watcher snapshots are dropped; HTTP events fall back to tmuxSession or get 202)'. If the maintainer prefers attribution over hiding: in ReadOnlyMuxStateSource::resolve_session_for_project_dir, when the pure resolver returns None but several sessions share the winning dir, tiebreak by pane presence - pick the unique candidate session for which pro
 - **F106** `packages/runtime-rs/src/shared.rs:57` — low · bug · _open_  
@@ -273,15 +273,15 @@ Generated from the 53-agent bug audit (10 area finders, 43 skeptical verifiers).
 - **F031** `packages/runtime-rs/src/tmux_scripting.rs:292` — low · bug · _open_  
   Width repair (hook pipelines and server enforce/repair paths) resize-panes the hidden sidebar while a content pane is zoomed, which unzooms the window after any client/window resize  
   Fix: Add `#{==:#{window_zoomed_flag},0}` to sidebar_width_repair_filter, include window_zoomed_flag in pane_format()/SidebarPane so sidebar_panes_to_resize and repair_context_sidebar_width skip zoomed windows, and treat repair-width from a sidebar whose window is zoomed as a no-op. The width is then repaired on unzoom: `resize-pane -Z` fires after-resize-pane (already installed) and the sidebar TUI sends repair-width when its pane becomes visible again.
-- **F042** `packages/runtime-rs/src/tracker.rs:103` — low · bug · _agent redesign_  
+- **F042** `packages/runtime-rs/src/tracker.rs:103` — low · bug · _fixed 2026-09-13 (agent redesign)_  
   mark_seen clears the unseen set but not the stored event.unseen flag, so after the websocket mark-seen command the session reports unseen:false while every agent row still serializes unseen:true  
   Fix: Derive the serialized flag purely from the set in get_agents/get_state: `event.unseen = self.unseen_instances.contains(&key).then_some(true)` (overwriting in both directions), or additionally set event.unseen = None for each instance inside mark_seen.
-- **F043** `packages/runtime-rs/src/tracker.rs:695` — low · bug · _agent redesign_  
+- **F043** `packages/runtime-rs/src/tracker.rs:695` — low · bug · _fixed 2026-09-13 (agent redesign)_  
   Tracker bookkeeping for killed/renamed sessions is never released: event_timestamps, empty instance maps and Alive entries of sessions no longer in list_sessions live for the life of the server  
   Fix: In sync_agent_pane_presence (lib.rs:533-537) pass the live session-name set to a new tracker method (e.g. retain_sessions) that, for every tracked session not in the set, either drops it outright or applies apply_pane_presence(session, vec![]) so its Alive entries flip to Exited/exited_at and are reaped by the existing prune rules; and have remove_instance/prune_where/dismiss drop event_timestamps[session] (and the empty map) when a session's last instance goes.
 - **F044** `packages/runtime-rs/src/tracker.rs:863` — low · unclear · _fixed 2026-09-13_  
   Stale counts as a terminal state for unseen tracking (a silent tool call >15 s marks the session unseen) while CONTRACTS.md/README/features docs say unseen is only for done/error/interrupted
-- **F105** `packages/runtime-rs/src/watch_plan.rs:32` — low · unclear · _open_  
+- **F105** `packages/runtime-rs/src/watch_plan.rs:32` — low · unclear · _fixed 2026-09-13_  
   watch_plan and lifecycle_operation are orphaned migration-plan models; portless::load_portless_state was never wired into the Rust server, so the TS server's portless local-link behaviour was silently dropped  
   Fix: Two independent decisions for the maintainer. (a) Delete `packages/runtime-rs/src/watch_plan.rs` and `packages/runtime-rs/src/lifecycle_operation.rs` plus their `pub mod` lines at `packages/runtime-rs/src/lib.rs:6` and `:22`; they model an abandoned notify-based watch service and an abandoned reducer whose tests were removed in 6310a58, and their numbers/roots no longer match the shipped scanners. Update `docs/explanation/sidebar-state-chaos-grill.md:130-131` to stop citing deleted files (or mar
 - **F059** `packages/sidebar-core-rs/src/app.rs:227` — low · bug · _open_  
@@ -307,7 +307,7 @@ Generated from the 53-agent bug audit (10 area finders, 43 skeptical verifiers).
 - **F111** `packages/sidebar-core-rs/src/renderer.rs:26` — low · bug · _open_  
   Documented 'click a port to open http://localhost:<port>' has no implementation: the ⌁port badge click switches session and the detail-panel 'local localhost:<port>' row click does nothing  
   Fix: Either implement or un-document. Minimal implementation: add `HitTarget::OpenUrl(String)`; in `build_session_detail_row` (renderer.rs:1058-1064) push the `⌁port` badge with `line.push_hit(port_text, port_color, HitTarget::OpenUrl(format!("http://localhost:{}", session.ports[0])))` (or better, use `session.local_links[0].url` so portless routes are honored), and in `render_detail` (renderer.rs:1160-1176) push each link label with `push_hit(..., HitTarget::OpenUrl(link.url.clone()))`; add `LaunchT
-- **F067** `packages/sidebar-core-rs/src/renderer.rs:308` — low · unclear · _open_  
+- **F067** `packages/sidebar-core-rs/src/renderer.rs:308` — low · unclear · _fixed 2026-09-13_  
   Header spinner count uses the attention-signal set (incl. error/stale/interrupted) and counts ALL sessions rather than visible ones, so it disagrees with group '⠹N' counts and the 'running' filter  
   Fix: Pick one definition: either count with the shared running predicate (Running|ToolRunning|Waiting, e.g. reuse session_display's session_has_active_agent) over app.filtered_sessions(), or keep the attention set but render it with a non-spinner glyph (e.g. ⚡ as documented) and apply the same set in group_summary. In both cases iterate filtered_sessions() so the count matches the visible list as the design doc states.
 - **F064** `packages/sidebar-core-rs/src/renderer.rs:739` — low · bug · _open_  
