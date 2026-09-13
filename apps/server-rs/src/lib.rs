@@ -1262,10 +1262,7 @@ impl ReadOnlyMuxStateSource {
         let session = self
             .resolve_agent_event_session(body)
             .ok_or(AgentEventError::CouldNotResolveSession)?;
-        let ts = body
-            .get("ts")
-            .and_then(Value::as_u64)
-            .unwrap_or_else(|| (self.now_ms)());
+        let ts = normalize_event_ts(body.get("ts").and_then(Value::as_u64), (self.now_ms)());
         let pane_id = body
             .get("paneId")
             .and_then(Value::as_str)
@@ -2399,6 +2396,32 @@ fn encode_agent_project_dir(path: &str) -> String {
         .collect()
 }
 
+/// Seconds-since-epoch timestamps are below 1e12 until the year 33658, and
+/// millisecond ones have been above it since 2001.
+const MIN_PLAUSIBLE_TS_MS: u64 = 1_000_000_000_000;
+/// How far into the future a client timestamp may point before it is treated
+/// as clock skew and clamped to server time.
+const MAX_FUTURE_TS_MS: u64 = 60 * 60 * 1000;
+
+/// Normalise a client-supplied `/api/agent-event` timestamp to milliseconds
+/// (F116): a value that is clearly seconds is scaled up, a value in the far
+/// future is clamped to `now`, and a missing value is `now`.
+fn normalize_event_ts(ts: Option<u64>, now: u64) -> u64 {
+    let Some(ts) = ts else {
+        return now;
+    };
+    let ts = if ts < MIN_PLAUSIBLE_TS_MS {
+        ts.saturating_mul(1000)
+    } else {
+        ts
+    };
+    if ts > now.saturating_add(MAX_FUTURE_TS_MS) {
+        now
+    } else {
+        ts
+    }
+}
+
 fn current_time_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3304,6 +3327,23 @@ fn parse_command(message: &Message) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_event_ts_in_seconds_is_scaled_to_milliseconds() {
+        let now = 1_789_315_528_128;
+        assert_eq!(normalize_event_ts(Some(1_789_315_528), now), 1_789_315_528_000);
+        assert_eq!(normalize_event_ts(Some(1_789_315_000_000), now), 1_789_315_000_000);
+        assert_eq!(normalize_event_ts(None, now), now);
+    }
+
+    #[test]
+    fn agent_event_ts_far_in_the_future_is_clamped_to_now() {
+        let now = 1_789_315_528_128;
+        assert_eq!(normalize_event_ts(Some(now + 5 * 60 * 1000), now), now + 5 * 60 * 1000);
+        assert_eq!(normalize_event_ts(Some(now + 2 * 60 * 60 * 1000), now), now);
+        // A seconds value that is also in the future gets both treatments.
+        assert_eq!(normalize_event_ts(Some(now / 1000 + 7200), now), now);
+    }
 
     #[test]
     fn hello_frame_carries_the_package_version_and_protocol() {

@@ -125,13 +125,10 @@ Smallest implementation slice later:
 4. add tests proving late identify/ensure/toggle cannot move `closing…` back to ready/warming
 5. keep existing quit broadcast/drain/cleanup mechanics
 
-Isolated proof-of-shape:
+Isolated proof-of-shape (historical):
 
-- `packages/runtime-rs/src/lifecycle_operation.rs` models a server-owned Lifecycle Operation reducer.
-- `packages/runtime-rs/tests/lifecycle_operation.rs` simulates connected clients, quit, late sidebar identify, warmup completion, and drain completion.
-- The test proves the key invariant: once `RequestQuit` moves the Server Generation to `Closing`, later lifecycle messages cannot move it back to `Warming` or `Ready`.
-- The test also covers 100 connected clients: `Quit` sends `quit` to every other client, does not send `quit` back to the requesting client, and rejects a re-entrant `Quit` submission through the Lifecycle Channel while effects are being delivered.
-- Width adjustment was deliberately removed from the isolated reducer. Fixed Sidebar Width is server-owned and changed only by explicit debounced live width commands from the TUI slider, so the reducer models lifecycle/presence/switch/quit only.
+- An isolated Lifecycle Operation reducer (`lifecycle_operation.rs`) and its simulation test once modelled this: once `RequestQuit` moves the Server Generation to `Closing`, later lifecycle messages cannot move it back to `Warming` or `Ready`; `Quit` fans out to every other client but not the requester, and a re-entrant `Quit` through the Lifecycle Channel is rejected while effects are being delivered.
+- The reducer and its test were removed once the shipped `SidebarCoordinator` covered the same invariants; the notes above remain the contract.
 
 Live red contract:
 

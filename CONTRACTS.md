@@ -115,7 +115,7 @@ External `/api/agent-event` callers send the same shape except they use `tmuxSes
 | `status` | `AgentStatus` | yes | Current agent state |
 | `tmuxSession` | `string` | one of `tmuxSession` / `projectDir` | Exact tmux session name |
 | `projectDir` | `string` | one of `tmuxSession` / `projectDir` | Project directory used for session resolution |
-| `ts` | `number` | no | Millisecond timestamp; server time is used when omitted |
+| `ts` | `number` | no | Millisecond timestamp; server time is used when omitted. A value below 10^12 is treated as seconds and scaled; a value more than an hour in the future is replaced by server time |
 | `threadId` | `string` | no | Stable instance key for multiple threads in one session |
 | `threadName` | `string` | no | Human-readable label shown in the detail panel |
 | `lastUserPrompt` | `string` | no | Latest user prompt/intent, shown in agent detail UI |
