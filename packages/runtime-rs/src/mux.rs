@@ -34,6 +34,27 @@ pub struct AgentPane {
     pub thread_name: Option<String>,
 }
 
+/// One content pane of the mux, as observed in a single listing pass. This is
+/// the only pane fact the agent tracker consumes: explicit bindings are
+/// checked against `pane_id`, registry records against `pid`, and the alias
+/// heuristic looks at `command`/`title`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MuxPane {
+    pub pane_id: String,
+    pub session_name: String,
+    pub window_id: String,
+    /// The pane's window is the current window of its session.
+    pub window_active: bool,
+    /// The pane is the active pane of its window.
+    pub active: bool,
+    /// Pid of the process the mux started in the pane (the shell, usually).
+    pub pid: u32,
+    pub command: String,
+    pub title: String,
+    /// The pane's process has exited but the pane is kept by remain-on-exit.
+    pub dead: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientFocus {
     pub client_tty: Option<String>,
@@ -106,6 +127,20 @@ pub trait MuxProvider: Send + Sync {
     }
 
     fn list_agent_panes(&self, _session_name: &str) -> Vec<AgentPane> {
+        Vec::new()
+    }
+
+    /// Every content pane of every session (sidebar and stash panes excluded)
+    /// in one listing, so callers can sync agent state without a per-session
+    /// round trip.
+    fn list_all_panes(&self) -> Vec<MuxPane> {
+        Vec::new()
+    }
+
+    /// The current pane of every attached client. Drives the "seen" rule:
+    /// a finished agent counts as seen only while it is the active pane of an
+    /// attached client.
+    fn list_client_focus(&self) -> Vec<ClientFocus> {
         Vec::new()
     }
 

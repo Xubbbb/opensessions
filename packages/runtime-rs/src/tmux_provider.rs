@@ -3,7 +3,8 @@ use std::process::Command;
 use std::sync::Arc;
 
 use crate::mux::{
-    ActiveWindow, AgentPane, ClientFocus, MuxProvider, MuxSessionInfo, SidebarPane, SidebarPosition,
+    ActiveWindow, AgentPane, ClientFocus, MuxPane, MuxProvider, MuxSessionInfo, SidebarPane,
+    SidebarPosition,
 };
 use crate::tmux_scripting::{
     delayed_http_hook_command, hook_context_format, hook_slot, http_hook_command,
@@ -107,6 +108,8 @@ pub struct PaneInfo {
     pub right: u16,
     /// The pane's process has exited but the pane is kept by `remain-on-exit`.
     pub dead: bool,
+    /// The pane's window is the current window of its session.
+    pub window_active: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,6 +154,21 @@ impl TmuxClient {
 
     pub fn list_clients(&self) -> Vec<ClientInfo> {
         parse_clients(&self.run(&["list-clients", "-F", client_format()]).stdout)
+    }
+
+    /// The current pane of every attached client: `#{pane_id}` in a
+    /// `list-clients` format expands to the active pane of the client's
+    /// current window.
+    pub fn list_client_focus(&self) -> Vec<ClientFocus> {
+        parse_client_focus(
+            &self
+                .run(&[
+                    "list-clients",
+                    "-F",
+                    "#{client_tty}\t#{session_name}\t#{window_id}\t#{pane_id}",
+                ])
+                .stdout,
+        )
     }
 
     pub fn list_panes(&self, scope: PaneScope<'_>) -> Vec<PaneInfo> {
@@ -685,18 +703,39 @@ impl MuxProvider for TmuxProvider {
     }
 
     fn list_agent_panes(&self, session_name: &str) -> Vec<AgentPane> {
+        agent_panes_from(
+            &self
+                .list_all_panes()
+                .into_iter()
+                .filter(|pane| pane.session_name == session_name)
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn list_all_panes(&self) -> Vec<MuxPane> {
         self.client
-            .list_panes(PaneScope::Session(session_name))
+            .list_panes(PaneScope::All)
             .into_iter()
-            .filter(|pane| pane.title != "opensessions-sidebar")
-            .filter_map(|pane| agent_from_pane(&pane).map(|agent| (pane, agent)))
-            .map(|(pane, agent)| AgentPane {
-                thread_name: thread_name_from_pane(&pane, &agent),
-                agent,
+            .filter(|pane| pane.session_name != STASH_SESSION && !is_sidebar_pane(pane))
+            .map(|pane| MuxPane {
                 pane_id: pane.id,
+                session_name: pane.session_name,
+                window_id: pane.window_id,
+                window_active: pane.window_active,
                 active: pane.active,
-                thread_id: None,
+                pid: pane.pid,
+                command: pane.command,
+                title: pane.title,
+                dead: pane.dead,
             })
+            .collect()
+    }
+
+    fn list_client_focus(&self) -> Vec<ClientFocus> {
+        self.client
+            .list_client_focus()
+            .into_iter()
+            .filter(|focus| focus.session_name != STASH_SESSION)
             .collect()
     }
 
@@ -942,7 +981,7 @@ fn client_format() -> &'static str {
 }
 
 fn pane_format() -> &'static str {
-    "#{pane_id}\t#{session_name}\t#{window_id}\t#{window_index}\t#{pane_index}\t#{pane_active}\t#{pane_tty}\t#{pane_pid}\t#{pane_current_path}\t#{pane_current_command}\t#{pane_title}\t#{pane_width}\t#{pane_height}\t#{pane_left}\t#{pane_right}\t#{pane_dead}"
+    "#{pane_id}\t#{session_name}\t#{window_id}\t#{window_index}\t#{pane_index}\t#{pane_active}\t#{pane_tty}\t#{pane_pid}\t#{pane_current_path}\t#{pane_current_command}\t#{pane_title}\t#{pane_width}\t#{pane_height}\t#{pane_left}\t#{pane_right}\t#{pane_dead}\t#{window_active}"
 }
 
 /// tmux resolves a bare `-t <name>` on window/pane commands (`list-panes -s`,
@@ -959,9 +998,38 @@ fn exact_session_target(name: &str) -> String {
     format!("={name}")
 }
 
+fn is_sidebar_pane(pane: &PaneInfo) -> bool {
+    pane.title == "opensessions-sidebar"
+}
+
+/// Agent-looking panes among `panes`, detected from process name and title.
+/// This is Agent Pane Presence (see CONTEXT.md): it may bind a pane to an
+/// agent row, it never authors agent status.
+pub fn agent_panes_from(panes: &[MuxPane]) -> Vec<AgentPane> {
+    panes
+        .iter()
+        .filter_map(|pane| {
+            let agent = detect_agent(&pane.title, &pane.command)?;
+            Some(AgentPane {
+                thread_name: thread_name_from_title(&pane.title, &agent),
+                agent,
+                pane_id: pane.pane_id.clone(),
+                active: pane.active,
+                thread_id: None,
+            })
+        })
+        .collect()
+}
+
 fn agent_from_pane(pane: &PaneInfo) -> Option<String> {
-    let title = pane.title.to_lowercase();
-    let command = pane.command.to_lowercase();
+    detect_agent(&pane.title, &pane.command)
+}
+
+/// Which agent CLI, if any, a pane with this title and current command looks
+/// like it is running.
+pub fn detect_agent(title: &str, command: &str) -> Option<String> {
+    let title = title.to_lowercase();
+    let command = command.to_lowercase();
     if title == "pi" || title.starts_with("pi ") || title.starts_with('π') || command == "pi" {
         return Some("pi".to_string());
     }
@@ -1002,8 +1070,8 @@ const AGENT_ALIASES: &[(&str, &[&str])] = &[
     ("qodercli", &["qodercli", "qoderclicn", "qoder", "qodercn"]),
 ];
 
-fn thread_name_from_pane(pane: &PaneInfo, agent: &str) -> Option<String> {
-    let title = pane.title.trim();
+fn thread_name_from_title(title: &str, agent: &str) -> Option<String> {
+    let title = title.trim();
     if agent == "amp"
         && let Some((thread_name, _)) = title.split_once(" - amp - ")
     {
@@ -1096,6 +1164,29 @@ fn parse_panes(raw: &str) -> Vec<PaneInfo> {
                 left: parse_u16(&parts, 13),
                 right: parse_u16(&parts, 14),
                 dead: part(&parts, 15) == "1",
+                window_active: part(&parts, 16) == "1",
+            })
+        })
+        .collect()
+}
+
+fn parse_client_focus(raw: &str) -> Vec<ClientFocus> {
+    raw.lines()
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| {
+            let parts = split(line);
+            let session_name = part(&parts, 1);
+            let window_id = part(&parts, 2);
+            let pane_id = part(&parts, 3);
+            if session_name.is_empty() || window_id.is_empty() || pane_id.is_empty() {
+                return None;
+            }
+            let client_tty = part(&parts, 0);
+            Some(ClientFocus {
+                client_tty: (!client_tty.is_empty()).then_some(client_tty),
+                session_name,
+                window_id,
+                pane_id,
             })
         })
         .collect()
@@ -1196,6 +1287,138 @@ mod tests {
         format!(
             "{id}\t{session}\t@1\t0\t0\t1\t/dev/ttys1\t123\t/repo\tbash\t{title}\t80\t24\t{left}\t{right}"
         )
+    }
+
+    fn full_pane_row(
+        id: &str,
+        session: &str,
+        window: &str,
+        active: bool,
+        pid: u32,
+        command: &str,
+        title: &str,
+        dead: bool,
+        window_active: bool,
+    ) -> String {
+        format!(
+            "{id}\t{session}\t{window}\t0\t0\t{}\t/dev/ttys1\t{pid}\t/repo\t{command}\t{title}\t80\t24\t0\t79\t{}\t{}",
+            u8::from(active),
+            u8::from(dead),
+            u8::from(window_active),
+        )
+    }
+
+    #[test]
+    fn list_all_panes_reports_every_content_pane_with_its_process_in_one_call() {
+        let runner = Arc::new(ScriptedRunner::new(HashMap::from([(
+            "list-panes",
+            [
+                full_pane_row("%1", "work", "@1", true, 4242, "claude", "✳ work", false, true),
+                full_pane_row("%2", "work", "@2", false, 4300, "bash", "shell", true, false),
+                full_pane_row("%3", "work", "@1", false, 4301, "opensessions-sidebar", "opensessions-sidebar", false, true),
+                full_pane_row("%4", "_os_stash", "@9", true, 4302, "bash", "stash", false, true),
+            ]
+            .join("\n"),
+        )])));
+        let provider = TmuxProvider::new(runner.clone());
+
+        let panes = provider.list_all_panes();
+
+        assert_eq!(
+            panes,
+            vec![
+                MuxPane {
+                    pane_id: "%1".to_string(),
+                    session_name: "work".to_string(),
+                    window_id: "@1".to_string(),
+                    window_active: true,
+                    active: true,
+                    pid: 4242,
+                    command: "claude".to_string(),
+                    title: "✳ work".to_string(),
+                    dead: false,
+                },
+                MuxPane {
+                    pane_id: "%2".to_string(),
+                    session_name: "work".to_string(),
+                    window_id: "@2".to_string(),
+                    window_active: false,
+                    active: false,
+                    pid: 4300,
+                    command: "bash".to_string(),
+                    title: "shell".to_string(),
+                    dead: true,
+                },
+            ]
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "one tmux call lists every pane");
+        assert_eq!(calls[0][..2], ["list-panes", "-a"]);
+    }
+
+    #[test]
+    fn list_client_focus_reports_the_current_pane_of_every_attached_client() {
+        let runner = Arc::new(ScriptedRunner::new(HashMap::from([(
+            "list-clients",
+            "/dev/pts/8\twork\t@1\t%1\n/dev/pts/9\tdocs\t@4\t%7\n/dev/pts/3\t\t\t\n/dev/pts/2\t_os_stash\t@9\t%4"
+                .to_string(),
+        )])));
+        let provider = TmuxProvider::new(runner);
+
+        assert_eq!(
+            provider.list_client_focus(),
+            vec![
+                ClientFocus {
+                    client_tty: Some("/dev/pts/8".to_string()),
+                    session_name: "work".to_string(),
+                    window_id: "@1".to_string(),
+                    pane_id: "%1".to_string(),
+                },
+                ClientFocus {
+                    client_tty: Some("/dev/pts/9".to_string()),
+                    session_name: "docs".to_string(),
+                    window_id: "@4".to_string(),
+                    pane_id: "%7".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn agent_panes_are_derived_from_the_pane_list_without_extra_tmux_calls() {
+        let runner = Arc::new(ScriptedRunner::new(HashMap::from([(
+            "list-panes",
+            [
+                full_pane_row("%1", "work", "@1", true, 1, "claude", "✳ work", false, true),
+                full_pane_row("%2", "work", "@1", false, 2, "node", "Fix focus - amp - T1", false, true),
+                full_pane_row("%3", "docs", "@2", true, 3, "vim", "notes", false, true),
+            ]
+            .join("\n"),
+        )])));
+        let provider = TmuxProvider::new(runner.clone());
+
+        let agents = agent_panes_from(&provider.list_all_panes());
+
+        assert_eq!(
+            agents,
+            vec![
+                AgentPane {
+                    agent: "claude-code".to_string(),
+                    pane_id: "%1".to_string(),
+                    active: true,
+                    thread_id: None,
+                    thread_name: None,
+                },
+                AgentPane {
+                    agent: "amp".to_string(),
+                    pane_id: "%2".to_string(),
+                    active: false,
+                    thread_id: None,
+                    thread_name: Some("Fix focus".to_string()),
+                },
+            ]
+        );
+        assert_eq!(runner.calls.lock().unwrap().len(), 1);
     }
 
     #[test]
@@ -1358,6 +1581,7 @@ mod tests {
             left: 0,
             right: 79,
             dead: false,
+            window_active: true,
         };
         assert_eq!(
             agent_from_pane(&pane("host", "claude")).as_deref(),
