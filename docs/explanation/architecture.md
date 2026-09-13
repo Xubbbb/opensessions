@@ -68,8 +68,9 @@ The tmux provider is the more feature-complete reference implementation.
 
 Notable design choices:
 
-- tmux global hooks notify the server about focus changes, session creation, window changes, and resize events
-- hidden sidebars are moved into a dedicated stash session named `_os_stash` instead of being destroyed
+- tmux global hooks notify the server about focus changes, session creation, window changes, and resize events; each hook is written into its own array slot so hooks from other plugins on the same events are preserved
+- sidebar panes are spawned with a fixed `sh -c` launcher and `split-window -e` environment so the user's `default-shell` never has to parse POSIX syntax
+- `prefix o → e` temporarily parks the sidebar pane in a stash session named `_os_stash` while re-laying out the window
 - the TUI refocuses the main pane after capability detection to avoid escape-sequence leakage into the main pane
 - typed tmux command helpers live in the Rust tmux provider and tmux scripting modules
 - the tmux integration scripts live under `integrations/tmux-plugin`, while the sidebar launcher itself lives with the TUI app in `apps/tui/scripts/start.sh`
@@ -94,8 +95,8 @@ That centralization matters for three reasons:
 
 The runtime keeps a small set of operational files:
 
-- `/tmp/opensessions.pid` for server bootstrap health checks
-- `/tmp/opensessions-debug.log` for best-effort debug logging
+- `/tmp/opensessions.<server-key>.pid` for server bootstrap health checks
+- `$OPENSESSIONS_DEBUG_LOG` for debug logging, only when that variable is set (capped at 16 MB)
 - `~/.config/opensessions/session-order.json` for user-controlled session ordering
 - `~/.config/opensessions/config.json` for user configuration
 

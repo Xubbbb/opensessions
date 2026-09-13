@@ -13,12 +13,11 @@ The Rust server scans these agent data sources directly:
 ### Amp
 
 - Reads `~/.local/share/amp/threads/T-*.json`.
-- Reads `~/.local/share/amp/session.json` to clear unseen state when the active terminal thread is seen.
 - Resolves project directories from `env.initial.trees[0].uri`.
 
 ### Claude Code
 
-- Reads JSONL transcripts in `~/.claude/projects/<encoded-path>/*.jsonl`.
+- Reads JSONL transcripts in `~/.claude/projects/<encoded-path>/*.jsonl`, plus `$CLAUDE_CONFIG_DIR/projects/` and every `~/.claude*/projects/` sibling directory (multi-account setups).
 - Decodes project directories from folder names such as `-Users-me-project`.
 - Treats recent tool-use silence as `waiting` and long silence as `stale`.
 
@@ -49,7 +48,7 @@ POST /api/agent-event
 Example:
 
 ```bash
-curl -sS -X POST "http://127.0.0.1:7391/api/agent-event" \
+curl -sS -X POST "$(sh ~/.tmux/plugins/opensessions/integrations/tmux-plugin/scripts/port.sh)/api/agent-event" \
   -H 'content-type: application/json' \
   -d '{
     "agent": "my-agent",
@@ -71,7 +70,7 @@ The server resolves the target session from either:
 | `tmuxSession` | Exact tmux session name |
 | `projectDir` | Project/worktree directory; exact session-dir match wins, then parent/child prefix matching |
 
-If neither field can be resolved to a known session, the request is rejected.
+If neither field resolves to a session known to this server, the event is ignored with `202 Accepted` (not an error), so an integration can broadcast one event to every opensessions server on the machine and let each decide ownership. Malformed events get `400 Bad Request`.
 
 ## Agent Model
 
@@ -89,7 +88,7 @@ type AgentStatus =
   | "stale";
 ```
 
-Terminal states are `done`, `error`, and `interrupted`. The tracker uses those states to decide unseen behavior. `tool-running` is a running subtype used when the agent is actively using tools. `stale` means the last known running/waiting state has aged past the runtime threshold.
+Terminal states are `done`, `error`, `interrupted`, and `stale`; the tracker marks a session unseen when an instance enters any of them, so a run that went silent mid tool-call gets the same attention marker as a finished one. `tool-running` is a running subtype used when the agent is actively using tools. `stale` means the last known running/waiting state has aged past the runtime threshold (15 s of silence for the built-in transcript watchers).
 
 ### `AgentEvent`
 
@@ -129,7 +128,7 @@ External `/api/agent-event` callers send the same shape except they use `tmuxSes
 - Unseen state is tracked per instance, then derived to the session level.
 - Non-terminal updates clear unseen state for that instance.
 - Terminal instances become seen when the user focuses the associated pane/session according to the server's tmux focus tracking.
-- Stale/running cleanup is handled by the Rust tracker.
+- Terminal instances are pruned automatically: about 10 seconds after their pane is observed gone, otherwise after 5 minutes once seen or 30 minutes while unseen. Running instances with no live pane are dropped after 30 minutes of silence. The websocket `dismiss-agent` command removes one immediately; a Pi runtime `delete` also removes that Pi thread.
 
 ## Metadata HTTP API
 
@@ -174,7 +173,7 @@ Provider methods are synchronous because tmux operations are command-driven and 
 
 - The server computes `ServerState` from tmux sessions, git/cache state, metadata, ports, and tracked agent events.
 - Session ordering is persisted separately from tmux ordering.
-- tmux sidebars can be hidden into a stash session instead of being killed.
+- Toggling the sidebar off kills its panes; only `prefix o → e` uses the `_os_stash` session, briefly, while re-laying out a window.
 - tmux is the only supported built-in mux today.
 - The sidebar and helper scripts resolve the server port from the tmux socket via `OPENSESSIONS_SERVER_KEY`, defaulting to derived per-socket ports.
 - TPM installs use prebuilt binaries in `bin/`; local builds use `target/release` or `target/debug` as fallback paths.

@@ -1,11 +1,9 @@
-> **Part of the [Ataraxy Labs](https://ataraxy-labs.com) stack** — agent-native infrastructure for software development. See also: [sem](https://ataraxy-labs.com/sem) (semantic version control) · [weave](https://ataraxy-labs.com/weave) (entity-level merge driver) · [inspect](https://github.com/Ataraxy-Labs/inspect) (semantic code review).
->
-> Read the manifesto: https://ataraxy-labs.com/#thesis · Essays: https://ataraxy-labs.com/blogs · LLMs: https://ataraxy-labs.com/llms.txt
-
 # opensessions
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Star History](https://img.shields.io/github/stars/Ataraxy-Labs/opensessions?style=social)](https://github.com/Ataraxy-Labs/opensessions)
+[![Stars](https://img.shields.io/github/stars/Xubbbb/opensessions?style=social)](https://github.com/Xubbbb/opensessions)
+
+> This is a maintained fork of [Ataraxy-Labs/opensessions](https://github.com/Ataraxy-Labs/opensessions), which stopped receiving updates in mid-2026. It keeps the same install path and configuration, fixes the outstanding bugs, and carries over community fixes from the upstream pull-request queue. The original work is by Ataraxy Labs and contributors.
 
 tmux is all you need. make tmux great again :)
 
@@ -23,14 +21,14 @@ tmux is the only supported mux today. There is older zellij integration code in 
 
 Requirements:
 
-- `tmux`
+- `tmux` 3.0 or newer
 - [TPM](https://github.com/tmux-plugins/tpm)
 - `curl` or `wget` for downloading prebuilt binaries on first load
 
 Add this to `~/.tmux.conf`:
 
 ```tmux
-set -g @plugin 'Ataraxy-Labs/opensessions'
+set -g @plugin 'Xubbbb/opensessions'
 ```
 
 Then reload tmux and install plugins:
@@ -54,8 +52,10 @@ cargo build --release
 If you want the same setup as a single shell command:
 
 ```bash
-grep -q "Ataraxy-Labs/opensessions" ~/.tmux.conf 2>/dev/null || printf '\nset -g @plugin '\''Ataraxy-Labs/opensessions'\''\n' >> ~/.tmux.conf && tmux source-file ~/.tmux.conf && ~/.tmux/plugins/tpm/bin/install_plugins
+grep -q "Xubbbb/opensessions" ~/.tmux.conf 2>/dev/null || printf '\nset -g @plugin '\''Xubbbb/opensessions'\''\n' >> ~/.tmux.conf && tmux source-file ~/.tmux.conf && ~/.tmux/plugins/tpm/bin/install_plugins
 ```
+
+Switching from the upstream plugin: run the uninstall script from the old checkout first (see below), then replace `Ataraxy-Labs/opensessions` with `Xubbbb/opensessions` in `~/.tmux.conf` and install as above. Your `~/.config/opensessions/` configuration carries over unchanged.
 
 ## Update
 
@@ -79,7 +79,7 @@ Run the uninstall script **before** removing the plugin files — it cleans up t
 sh ~/.tmux/plugins/opensessions/integrations/tmux-plugin/scripts/uninstall.sh
 ```
 
-Then remove the `set -g @plugin 'Ataraxy-Labs/opensessions'` line from `~/.tmux.conf` and run `prefix + alt + u` (TPM uninstall).
+Then remove the `set -g @plugin 'Xubbbb/opensessions'` line from `~/.tmux.conf` and run `prefix + alt + u` (TPM uninstall).
 
 ## Today
 
@@ -89,25 +89,31 @@ Then remove the `set -g @plugin 'Ataraxy-Labs/opensessions'` line from `~/.tmux.
 - Programmatic metadata API: agents and scripts push status, progress, and logs to the sidebar via HTTP.
 - Fast switching with `j`/`k`, arrows, `Tab`, `1`-`9`, session reordering, hide/restore, creation, and kill actions.
 - `prefix o → s` and `prefix o → t` for sidebar focus and toggle, `prefix o → e` for sidebar-safe `even-horizontal` layout in the current window, `prefix o → 1` through `9` for quick switching, optional no-prefix shortcuts, and in-app theme switching.
+- Finished agents leave the sidebar on their own: shortly after their pane closes, or after a timeout otherwise (30 minutes while still unseen, 5 minutes once seen). `d` in the agents panel dismisses one immediately.
+- Works with any tmux `default-shell`, including fish; installs its tmux hooks in a dedicated array slot so it coexists with other plugins' hooks.
 - Native Rust sidebar built with ratatui 0.30 and crossterm 0.29, with a local Rust WebSocket/HTTP server.
 
 ## Programmatic API
 
-Scripts and agents can push custom metadata to the sidebar over HTTP — no binary needed:
+Scripts and agents can push custom metadata to the sidebar over HTTP — no binary needed. The server's port is derived from the tmux socket (`22000 + hash(socket path)`), so it differs per tmux server and is not `7391` (that is only the fallback outside tmux). Ask for it from inside tmux:
+
+```sh
+OPENSESSIONS_URL="$(sh ~/.tmux/plugins/opensessions/integrations/tmux-plugin/scripts/port.sh)"
+```
 
 ```sh
 # Set a status pill on a session
-curl -X POST http://127.0.0.1:7391/set-status \
+curl -X POST "$OPENSESSIONS_URL/set-status" \
   -H 'content-type: application/json' \
   -d '{"session":"my-app","text":"Deploying","tone":"warn"}'
 
 # Set progress
-curl -X POST http://127.0.0.1:7391/set-progress \
+curl -X POST "$OPENSESSIONS_URL/set-progress" \
   -H 'content-type: application/json' \
   -d '{"session":"my-app","current":3,"total":10,"label":"services"}'
 
 # Push a log entry
-curl -X POST http://127.0.0.1:7391/log \
+curl -X POST "$OPENSESSIONS_URL/log" \
   -H 'content-type: application/json' \
   -d '{"session":"my-app","message":"Tests passed","source":"ci","tone":"success"}'
 ```
@@ -123,11 +129,17 @@ Full reference: [docs/reference/programmatic-api.md](./docs/reference/programmat
 Build and run from a local clone:
 
 ```bash
-git clone https://github.com/Ataraxy-Labs/opensessions.git
+git clone https://github.com/Xubbbb/opensessions.git
 cd opensessions
 cargo build --release
-cargo test
+cargo test --workspace
 ```
+
+`cargo test --workspace` includes the tmux end-to-end suite, which starts private tmux servers on their own sockets and needs `tmux`, `git`, and `python3` on `PATH`.
+
+To point your own tmux at the checkout instead of the TPM copy, add `run '/absolute/path/to/opensessions/opensessions.tmux'` to `~/.tmux.conf` (or use `scripts/toggle-dev.sh` to flip between the two). Set `OPENSESSIONS_SKIP_BINARY_DOWNLOAD=1` in the environment tmux starts from so the checkout uses `target/` builds rather than downloading a release bundle.
+
+Debug logging is off by default. To capture it, set `OPENSESSIONS_DEBUG_LOG` to a file path in tmux's global environment before the server starts (`tmux set-environment -g OPENSESSIONS_DEBUG_LOG /tmp/opensessions-debug.log`, then `q` and reopen the sidebar). The file is capped at 16 MB.
 
 Start the sidebar manually (outside tmux, for testing):
 
@@ -156,11 +168,11 @@ For the full tmux workflow with keybindings, troubleshooting, and configuration 
 ## A Few Concrete Bits
 
 - Session ordering is persisted in `~/.config/opensessions/session-order.json`.
-- Amp watcher reads `~/.local/share/amp/threads/*.json` and clears unseen state from Amp's `session.json` when a thread becomes seen there.
-- Claude Code watcher reads JSONL transcripts in `~/.claude/projects/`.
+- Amp watcher reads `~/.local/share/amp/threads/*.json`.
+- Claude Code watcher reads JSONL transcripts in `~/.claude/projects/`, plus `$CLAUDE_CONFIG_DIR/projects/` and any sibling `~/.claude*/projects/` directory, so multiple Claude Code accounts all show up.
 - Codex watcher reads transcript JSONL files in `~/.codex/sessions/` or `$CODEX_HOME/sessions/` and resolves sessions from `turn_context.cwd`.
 - OpenCode watcher polls the SQLite database in `~/.local/share/opencode/opencode.db`.
-- Hidden sidebars are stashed in a tmux session named `_os_stash`, so they can come back without restarting the sidebar process.
+- Toggling the sidebar off closes its panes; `prefix o → e` briefly parks the sidebar pane in a tmux session named `_os_stash` while it re-lays out the window.
 - Clicking a detected port opens `http://localhost:<port>`.
 
 ## Repo Layout
@@ -190,10 +202,6 @@ For the full tmux workflow with keybindings, troubleshooting, and configuration 
 - Inline theme objects exist in core, but the running server persists and broadcasts theme names.
 - tmux is the only supported mux today.
 
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=Ataraxy-Labs/opensessions&type=Date)](https://star-history.com/#Ataraxy-Labs/opensessions&Date)
-
 ## License
 
-MIT
+MIT. Originally developed by Ataraxy Labs and contributors; maintained here as a fork.

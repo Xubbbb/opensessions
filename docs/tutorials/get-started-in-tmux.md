@@ -14,7 +14,7 @@ This tutorial gets opensessions running as a real tmux sidebar, either through T
 If you already use [TPM](https://github.com/tmux-plugins/tpm), run:
 
 ```bash
-grep -q "Ataraxy-Labs/opensessions" ~/.tmux.conf 2>/dev/null || printf '\nset -g @plugin '\''Ataraxy-Labs/opensessions'\''\n' >> ~/.tmux.conf && tmux source-file ~/.tmux.conf && ~/.tmux/plugins/tpm/bin/install_plugins
+grep -q "Xubbbb/opensessions" ~/.tmux.conf 2>/dev/null || printf '\nset -g @plugin '\''Xubbbb/opensessions'\''\n' >> ~/.tmux.conf && tmux source-file ~/.tmux.conf && ~/.tmux/plugins/tpm/bin/install_plugins
 ```
 
 Result: TPM clones the GitHub repo for you. The first time tmux loads the plugin, opensessions downloads the matching prebuilt binaries into `~/.tmux/plugins/opensessions/bin/`.
@@ -38,13 +38,13 @@ Open `~/.tmux.conf` and add one of these minimal entries:
 If you use TPM:
 
 ```tmux
-set -g @plugin 'Ataraxy-Labs/opensessions'
+set -g @plugin 'Xubbbb/opensessions'
 ```
 
 If you run from a local clone instead:
 
 ```tmux
-source-file /absolute/path/to/opensessions/opensessions.tmux
+run-shell /absolute/path/to/opensessions/opensessions.tmux
 ```
 
 If you added the TPM plugin line manually instead of using the one-line installer above, reload tmux and install plugins with:

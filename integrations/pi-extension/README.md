@@ -25,7 +25,7 @@ The extension POSTs the current Pi runtime identity to opensessions on localhost
 - `POST /api/agent-event` on `before_agent_start` with `status=running` and `lastUserPrompt`
 - `POST /api/agent-event` on `agent_end` with `status=done`
 
-By default it talks to `http://127.0.0.1:7391`.
+By default it talks to `http://127.0.0.1:7391` (only correct outside tmux; a plugin-launched server listens on `22000 + hash(tmux socket)` — print it with `integrations/tmux-plugin/scripts/port.sh` and export it as `OPENSESSIONS_URL`).
 Override with:
 
 ```bash

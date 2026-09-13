@@ -1,6 +1,6 @@
 # opensessions — AI Agent Instructions
 
-You are working on **opensessions**, an agent-agnostic terminal session manager and parallel-agent control plane.
+You are working on **opensessions**, an agent-agnostic terminal session manager and parallel-agent control plane. This repository is the maintained fork at `Xubbbb/opensessions`; upstream `Ataraxy-Labs/opensessions` is dormant.
 
 ## North Star
 
@@ -34,7 +34,7 @@ opensessions/
 ├── CONTRACTS.md            # Supported agent event and runtime integration contracts
 ├── opensessions.tmux       # Root TPM entrypoint
 ├── Cargo.toml              # Rust workspace root
-└── package.json            # Release version used by npm/TPM download helpers
+└── package.json            # Single version source: bumped by CI, read by the TPM download helper and apps/server-rs/build.rs
 ```
 
 ## Key Architecture Decisions
@@ -45,6 +45,9 @@ opensessions/
 4. **External agent events via HTTP**: third-party agents should POST to `/api/agent-event` or use the metadata endpoints. TypeScript plugin loading is not a supported runtime path right now.
 5. **Tmux is the supported mux**: abstractions remain mux-shaped, but tmux is the only documented supported provider. Older zellij helper code is not part of the support promise.
 6. **Release binaries, not local builds**: TPM users get prebuilt `opensessions-sidebar`, `opensessions-server`, and `lazydiff` binaries in `bin/`. `cargo build --release` is for development or unsupported platforms.
+7. **Version flow**: every push to `main` runs `auto-version.yml`, which bumps `package.json`, tags `vX`, and dispatches `release.yml` for that tag (a `GITHUB_TOKEN` tag push cannot trigger it on its own). `SERVER_VERSION` is derived from `package.json` by `apps/server-rs/build.rs`; never hardcode it.
+8. **tmux hooks live in array slot `90210`** (`tmux_scripting::HOOK_SLOT`) so other plugins' hooks on the same events survive; `uninstall.sh` mirrors the constant. The sidebar pane command is a fixed `sh -c '...'` string with per-pane values passed via `split-window -e`, so it works under fish and other non-POSIX default shells.
+9. **Debug logging is opt-in**: `opensessions_runtime::debug_log` writes only when `OPENSESSIONS_DEBUG_LOG` is set, capped at 16 MB. Do not reintroduce an always-on default path.
 
 ## Contracts
 
@@ -95,6 +98,7 @@ The Rust trait lives in `packages/runtime-rs/src/mux.rs`. Keep methods synchrono
 - **Sidebar resize work**: before changing sidebar spawning, width sync, tmux resize handling, or `sidebar-coordinator`, read `docs/explanation/sidebar-behavior.md` and preserve those invariants unless you update the doc in the same change.
 - **Built-in watchers in Rust runtime/server**: Amp, Claude Code, Codex, OpenCode, Pi, and Droid watcher parsing lives in `packages/runtime-rs/src/agent_watchers.rs` and server scanning lives in `apps/server-rs/src/lib.rs`.
 - **Do not reintroduce pane-derived agent status**: panes can help focus/kill/routing, but watcher/API events are the source of agent status.
+- **Agent pruning runs in `snapshot_json`**: `AgentTracker::prune_terminal`/`prune_stuck` reap finished or abandoned agents (see the TTL constants in `tracker.rs`); keep them called on every snapshot.
 
 ## Common Commands
 
@@ -105,10 +109,10 @@ cargo test -p opensessions-sidebar --test tmux_e2e -- --nocapture
 cargo build --release                          # Build local dev binaries
 cargo run -p opensessions-server               # Start server directly
 cargo run -p opensessions-sidebar              # Start sidebar directly
-bun test scripts/postinstall.test.ts           # Postinstall helper tests
+cargo clippy --workspace --all-targets         # Lint
 ```
 
-Use `rtk` prefixes when running shell commands, per the user-level instructions.
+The tmux E2E suite starts private tmux servers (`tmux -L opensessions-e2e-*`) and needs `tmux`, `git`, and `python3`; it never touches the user's own tmux server.
 
 ## Adding A New Built-In Mux Provider
 

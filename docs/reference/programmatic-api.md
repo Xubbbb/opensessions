@@ -4,7 +4,11 @@ opensessions exposes HTTP endpoints that let agents, scripts, and CI pipelines p
 
 ## Endpoints
 
-All endpoints accept `POST` with `Content-Type: application/json` on `127.0.0.1:7391`.
+All endpoints accept `POST` with `Content-Type: application/json` on the local server. The port is derived from the tmux socket (`22000 + hash(socket path)`), so it differs per tmux server; `7391` is only the fallback used outside tmux. The examples below read it into `OPENSESSIONS_URL` first:
+
+```sh
+OPENSESSIONS_URL="$(sh ~/.tmux/plugins/opensessions/integrations/tmux-plugin/scripts/port.sh)"
+```
 
 ### `POST /set-status`
 
@@ -12,12 +16,12 @@ Set a status pill on a session. Shows in both the session card and the detail pa
 
 ```sh
 # Set status
-curl -sS -X POST http://127.0.0.1:7391/set-status \
+curl -sS -X POST "$OPENSESSIONS_URL"/set-status \
   -H 'content-type: application/json' \
   -d '{"session":"api","text":"Indexing","tone":"info"}'
 
 # Clear status
-curl -sS -X POST http://127.0.0.1:7391/set-status \
+curl -sS -X POST "$OPENSESSIONS_URL"/set-status \
   -H 'content-type: application/json' \
   -d '{"session":"api","text":null}'
 ```
@@ -34,17 +38,17 @@ Set a progress indicator on a session. Shows as a compact summary (e.g. `3/10` o
 
 ```sh
 # Set progress with current/total
-curl -sS -X POST http://127.0.0.1:7391/set-progress \
+curl -sS -X POST "$OPENSESSIONS_URL"/set-progress \
   -H 'content-type: application/json' \
   -d '{"session":"api","current":3,"total":10,"label":"files"}'
 
 # Set progress with percent
-curl -sS -X POST http://127.0.0.1:7391/set-progress \
+curl -sS -X POST "$OPENSESSIONS_URL"/set-progress \
   -H 'content-type: application/json' \
   -d '{"session":"api","percent":0.75,"label":"deploying"}'
 
 # Clear progress
-curl -sS -X POST http://127.0.0.1:7391/set-progress \
+curl -sS -X POST "$OPENSESSIONS_URL"/set-progress \
   -H 'content-type: application/json' \
   -d '{"session":"api","clear":true}'
 ```
@@ -63,7 +67,7 @@ curl -sS -X POST http://127.0.0.1:7391/set-progress \
 Append a structured log entry to a session. Last 8 entries are visible in the detail panel.
 
 ```sh
-curl -sS -X POST http://127.0.0.1:7391/log \
+curl -sS -X POST "$OPENSESSIONS_URL"/log \
   -H 'content-type: application/json' \
   -d '{"session":"api","message":"Build started","source":"ci","tone":"info"}'
 ```
@@ -80,7 +84,7 @@ curl -sS -X POST http://127.0.0.1:7391/log \
 Clear all log entries for a session.
 
 ```sh
-curl -sS -X POST http://127.0.0.1:7391/clear-log \
+curl -sS -X POST "$OPENSESSIONS_URL"/clear-log \
   -H 'content-type: application/json' \
   -d '{"session":"api"}'
 ```
@@ -90,7 +94,7 @@ curl -sS -X POST http://127.0.0.1:7391/clear-log \
 Send a notification (currently appends to logs with highlighting). Same fields as `/log`.
 
 ```sh
-curl -sS -X POST http://127.0.0.1:7391/notify \
+curl -sS -X POST "$OPENSESSIONS_URL"/notify \
   -H 'content-type: application/json' \
   -d '{"session":"api","message":"Deploy complete","tone":"success","source":"cd"}'
 ```
@@ -133,7 +137,7 @@ curl -sS -X POST http://127.0.0.1:7391/notify \
 ```bash
 #!/bin/bash
 SESSION=$(tmux display-message -p '#{session_name}')
-URL="http://127.0.0.1:7391"
+URL="$(sh ~/.tmux/plugins/opensessions/integrations/tmux-plugin/scripts/port.sh)"
 
 curl -sS -X POST "$URL/set-status" \
   -H 'content-type: application/json' \

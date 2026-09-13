@@ -100,8 +100,8 @@ The accepted rule set is:
 - every sidebar pane whose title is `opensessions-sidebar` must be repaired to that width
 - `repair-width` from a TUI client carries no width; it only asks the server to re-apply Fixed Sidebar Width after tmux resized the pane
 - `after-resize-pane` performs direct tmux repair only; it fires during our own repairs, so it must stay cheap
-- `after-resize-window`, `after-kill-pane`, `pane-exited`, and `client-resized` first try direct tmux repair, then schedule a delayed server `repair configured width` fallback for layout churn that settles after the hook starts
-- `pane-exited` also notifies the server for orphan-sidebar cleanup
+- `after-resize-window` and `client-resized` first try direct tmux repair, then schedule a delayed server `repair configured width` fallback for layout churn that settles after the hook starts
+- `after-kill-pane`, `pane-exited`, and `pane-died` run their orphan/dead-pane sweep and then the direct tmux width repair *synchronously*, and only then notify the server in the background. By the time `kill-pane` returns, the sidebar is already back at Fixed Sidebar Width and the surviving content pane has absorbed the freed space; a background repair here was a race the width-churn E2E kept losing, and a synchronous server call would stall tmux whenever the server is busy
 - hook repair must be idempotent: only panes whose current width differs from Fixed Sidebar Width are resized
 - never install an unconditional `after-resize-pane -> resize-pane` loop; that can recurse and destabilize tmux
 
@@ -188,6 +188,8 @@ These are non-negotiable:
 - infer current session/window/pane from the active tmux command context where possible; do not let an unrelated attached client make width or focus decisions for the current sidebar
 - keep tmux windows in `window-size latest`; do not leave them in manual mode after `resize-window`
 - install both `pane-exited` and `after-kill-pane`; normal shell/process exit is not covered by `after-kill-pane` alone
+- install every hook in the dedicated array slot `HOOK_SLOT` (`after-select-window[90210]`, …). `set-hook -g <hook> <cmd>` without an index replaces the whole array and silently deletes hooks other plugins registered on the same event; on setup and cleanup remove only entries opensessions wrote (any slot, matched by content, so pre-slot releases are cleaned up too)
+- do not rely on `pane-died` firing: tmux ≤ 3.5a built with utempter (the Debian/Ubuntu packages) can lose the `SIGCHLD` of an exiting pane process, leaving a dead pane that never triggers `pane-died` until some other child of tmux exits. The tmux state poll therefore runs `run-shell -b true` whenever a dead pane is visible, which hands tmux a fresh `SIGCHLD` and lets the normal hook path continue; server shutdown kills every `opensessions-sidebar` pane itself instead of waiting for hooks
 - treat `pane-exited` and `after-kill-pane` as topology-change signals only; they must never adopt tmux's redistributed sidebar width as user intent
 - use `after-resize-pane` only as an idempotent fixed-width repair trigger for panes titled `opensessions-sidebar`; it must no-op when every sidebar pane is already at Fixed Sidebar Width
 - do not refocus the main pane immediately after sidebar spawn/restore; let the TUI refocus after capability detection settles so escape sequences do not leak into the main pane
@@ -307,6 +309,18 @@ What fixed it:
 - delete user-authored width ownership entirely
 - observed pane width is always drift, never intent
 
+### 8. Lost `pane-died` notifications
+
+What happened:
+
+- with `remain-on-exit` on, a shell exiting in a sidebar window sometimes left a dead pane behind indefinitely; the session-close E2E flaked about one run in three
+- tmux's verbose log showed the pty EOF arriving but no `SIGCHLD` for seconds, and the shell sitting as a zombie child of the tmux server; this reproduces in bare tmux 3.4 with no hooks at all (tmux issue #4559, utempter builds)
+
+What fixed it:
+
+- the tmux state poll nudges tmux with a trivial background job whenever a dead pane is visible
+- server shutdown removes sidebar panes explicitly instead of trusting `pane-died`
+
 ## Rejected Approaches
 
 These are not theoretical. They were tried and caused problems.
@@ -348,7 +362,7 @@ Before shipping any sidebar behavior change, verify all of these.
 - control-mode clients cannot steal foreground/current-session authority
 - hooks and sidebar clients point to the derived server for the current tmux socket
 - tmux windows remain in `window-size latest`
-- no resize or enforcement loop appears in `/tmp/opensessions-debug.log`
+- no resize or enforcement loop appears in the debug log (run with `OPENSESSIONS_DEBUG_LOG` set to capture one)
 
 ## Files To Read Before Changing This Area
 

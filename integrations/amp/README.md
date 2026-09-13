@@ -32,7 +32,7 @@ is required.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `OPENSESSIONS_URL` | `http://127.0.0.1:7391` | opensessions server base URL |
+| `OPENSESSIONS_URL` | `http://127.0.0.1:7391` (only correct outside tmux; a plugin-launched server listens on `22000 + hash(tmux socket)` — print it with `integrations/tmux-plugin/scripts/port.sh` and export it as `OPENSESSIONS_URL`) | opensessions server base URL |
 
 ## Event mapping
 

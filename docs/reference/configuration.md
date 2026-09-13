@@ -100,7 +100,7 @@ Minimal install:
 If you use TPM, this is enough:
 
 ```tmux
-set -g @plugin 'Ataraxy-Labs/opensessions'
+set -g @plugin 'Xubbbb/opensessions'
 ```
 
 After adding it, reload tmux and ask TPM to install plugins:
@@ -112,10 +112,10 @@ tmux source-file ~/.tmux.conf
 
 On first load, the plugin downloads the matching GitHub release bundle into `~/.tmux/plugins/opensessions/bin/`. The bundle contains `opensessions-sidebar`, `opensessions-server`, and the bundled `lazydiff` binary. You do not need Rust/Cargo for the normal TPM install path.
 
-If you run from a local checkout instead, this is enough:
+If you run from a local checkout instead, this is enough (`run-shell`, not `source-file`: the entrypoint is a bash script, not tmux configuration):
 
 ```tmux
-source-file /absolute/path/to/opensessions/opensessions.tmux
+run-shell /absolute/path/to/opensessions/opensessions.tmux
 ```
 
 Optional overrides:
@@ -132,7 +132,9 @@ All other tmux options fall back to the defaults shown in the table above.
 
 | Variable | Used by | Notes |
 | --- | --- | --- |
+| `CLAUDE_CONFIG_DIR` | Claude Code watcher | Extra Claude Code config directory to scan (`<dir>/projects/`) in addition to `~/.claude` and any `~/.claude*` sibling |
 | `OPENCODE_DB_PATH` | OpenCode watcher | Overrides the default SQLite path |
+| `OPENSESSIONS_DEBUG_LOG` | server and sidebar | Path of a shared debug log. Logging is off unless this is set; the file is truncated once it passes 16 MB. Set it in tmux's global environment (`tmux set-environment -g`) before the server starts |
 | `OPENSESSIONS_DIR` | tmux helper scripts and server | Helps helper scripts find the repo checkout |
 | `OPENSESSIONS_HOST` | server, sidebar, helper shell scripts | Runtime host override; normally `127.0.0.1` |
 | `OPENSESSIONS_PORT` | server, sidebar, helper shell scripts | Runtime port override; normally derived from the tmux socket/server key |
@@ -148,8 +150,11 @@ All other tmux options fall back to the defaults shown in the table above.
 | Path | Purpose |
 | --- | --- |
 | `~/.config/opensessions/session-order.json` | Persisted custom session ordering |
-| `/tmp/opensessions.pid` | PID file used by server bootstrap logic |
-| `/tmp/opensessions-debug.log` | Best-effort debug log written by the server and providers |
+| `~/.config/opensessions/config.json` | Updated when the width slider or detail-panel height changes |
+| `/tmp/opensessions.<server-key>.pid` | PID file used by server bootstrap logic (`/tmp/opensessions.pid` outside tmux) |
+| `/tmp/opensessions.<server-key>.server.log` | Server stdout/stderr from the plugin launcher |
+| `/tmp/opensessions-err.log` | Sidebar stderr (panics and launch banners) |
+| `$OPENSESSIONS_DEBUG_LOG` | Debug log, only when that variable is set |
 
 ## Mux Detection Rules
 
