@@ -12,7 +12,7 @@ use crate::app::{App, DisplaySessionEntry, Modal};
 use crate::generated::protocol::{
     AgentEvent, AgentPanelScope, AgentStatus, MetadataTone, SessionData,
 };
-use crate::session_display::worktree_group_key;
+use crate::session_display::{session_has_active_agent, worktree_group_key};
 
 const MAX_AGENT_PROMPT_LINES: usize = 3;
 
@@ -88,7 +88,18 @@ pub(crate) fn build_model(app: &App, width: usize, height: usize) -> RenderModel
     }
     lines.push(separator(&palette, width));
     let [footer_top, footer_bottom] = footer(&palette, width);
-    lines.push(footer_top);
+    match app.active_notice() {
+        Some(notice) => {
+            let mut line = StyledLine::blank();
+            line.push(" ", palette.white);
+            line.push(
+                truncate_right(notice, width.saturating_sub(1)),
+                palette.peach,
+            );
+            lines.push(line);
+        }
+        None => lines.push(footer_top),
+    }
     lines.push(footer_bottom);
     while lines.len() < height {
         lines.push(StyledLine::blank());
@@ -302,12 +313,16 @@ struct ScrollbarSpec {
 
 fn header(app: &App, palette: &Palette, width: usize) -> StyledLine {
     let sessions = app.filtered_sessions().count();
+    // Same definition of "running" as the group badges and the `running`
+    // filter, over the sessions that are actually listed (F067).
     let running = app
-        .sessions
-        .iter()
-        .filter(|session| session_attention_signal(session).is_active())
+        .filtered_sessions()
+        .filter(|session| session_has_active_agent(session))
         .count();
-    let unseen = app.sessions.iter().filter(|session| session.unseen).count();
+    let unseen = app
+        .filtered_sessions()
+        .filter(|session| session.unseen)
+        .count();
 
     let mut line = StyledLine::blank();
     line.push(" sessions", palette.subtext0);
@@ -1892,6 +1907,9 @@ fn agent_panel_block(
     let mut secondary = StyledLine::with_bg(bg);
     secondary.push("    ", palette.white);
     secondary.push(visual.label, visual.color);
+    if let Some(detail) = entry.agent.detail.as_deref() {
+        secondary.push(format!(" ({detail})"), visual.color);
+    }
     secondary.push(" · ", palette.overlay0);
     secondary.push(&entry.agent.agent, palette.overlay0);
 
@@ -1984,58 +2002,6 @@ fn compact_agent_panel_block(
         })
         .with_hit(hit),
     ]
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum AttentionSignal {
-    Unknown,
-    Idle,
-    DoneSeen,
-    Working,
-    ToolWorking,
-    DoneUnseen,
-    Waiting,
-    Interrupted,
-    Stale,
-    Error,
-}
-
-impl AttentionSignal {
-    fn is_active(self) -> bool {
-        matches!(
-            self,
-            Self::Working
-                | Self::ToolWorking
-                | Self::Waiting
-                | Self::Interrupted
-                | Self::Stale
-                | Self::Error
-        )
-    }
-}
-
-fn session_attention_signal(session: &SessionData) -> AttentionSignal {
-    session
-        .agent_state
-        .iter()
-        .chain(session.agents.iter())
-        .map(agent_attention_signal)
-        .max()
-        .unwrap_or(AttentionSignal::Unknown)
-}
-
-fn agent_attention_signal(agent: &AgentEvent) -> AttentionSignal {
-    match agent.status {
-        AgentStatus::Error => AttentionSignal::Error,
-        AgentStatus::Stale => AttentionSignal::Stale,
-        AgentStatus::Interrupted => AttentionSignal::Interrupted,
-        AgentStatus::Waiting => AttentionSignal::Waiting,
-        AgentStatus::Done if agent.unseen == Some(true) => AttentionSignal::DoneUnseen,
-        AgentStatus::ToolRunning => AttentionSignal::ToolWorking,
-        AgentStatus::Running => AttentionSignal::Working,
-        AgentStatus::Done => AttentionSignal::DoneSeen,
-        AgentStatus::Idle => AttentionSignal::Idle,
-    }
 }
 
 fn footer(palette: &Palette, width: usize) -> [StyledLine; 2] {
@@ -2850,7 +2816,9 @@ const WHITE: Rgb = Rgb::new(255, 255, 255);
 mod tests {
     use super::*;
     use crate::app::{App, KillTarget, Modal};
-    use crate::generated::protocol::{AgentEvent, ClientCommand, ServerState, SessionData};
+    use crate::generated::protocol::{
+        AgentEvent, ClientCommand, ServerState, SessionData, SessionFilterMode,
+    };
 
     fn agent(agent: &str, status: AgentStatus, thread_name: Option<&str>) -> AgentEvent {
         AgentEvent {
@@ -3015,6 +2983,57 @@ mod tests {
         assert_eq!(
             compute_hit_target(&app, width - 1, detail_row, width, height),
             Some(HitTarget::DiffCount("opensessions".to_string()))
+        );
+    }
+
+    #[test]
+    fn agent_detail_and_idle_rows_render_status_qualifiers() {
+        let mut current = session("opensessions", "/tmp/opensessions", "main");
+        let mut delegating = agent("claude-code", AgentStatus::Running, Some("opensessions-1"));
+        delegating.detail = Some("delegating".to_string());
+        let mut blocked = agent("claude-code", AgentStatus::Waiting, Some("hero-v2"));
+        blocked.detail = Some("dialog open".to_string());
+        let idle = agent("claude-code", AgentStatus::Idle, Some("gdb"));
+        current.agents.extend([delegating, blocked, idle]);
+        let mut app = app_from_sessions(vec![current]);
+        app.detail_panel_height = 20;
+
+        let rendered = render_text(&app, 60, 40);
+
+        assert_has_line(&rendered, "    working (delegating) · claude-code");
+        assert_has_line(&rendered, "    blocked (dialog open) · claude-code");
+        assert_has_line(&rendered, "  ✓ gdb");
+        assert_has_line(&rendered, "    idle · claude-code");
+    }
+
+    #[test]
+    fn header_spinner_count_matches_the_running_predicate_over_visible_sessions() {
+        let mut running = session("running", "/tmp/running", "main");
+        running
+            .agents
+            .push(agent("codex", AgentStatus::ToolRunning, Some("build")));
+        let mut waiting = session("waiting", "/tmp/waiting", "main");
+        waiting
+            .agents
+            .push(agent("amp", AgentStatus::Waiting, Some("approve")));
+        let mut errored = session("errored", "/tmp/errored", "main");
+        errored
+            .agents
+            .push(agent("amp", AgentStatus::Error, Some("boom")));
+        let mut hidden_running = session("hidden", "/tmp/hidden", "main");
+        hidden_running
+            .agents
+            .push(agent("amp", AgentStatus::Running, Some("quiet")));
+        let mut app = app_from_sessions(vec![running, waiting, errored, hidden_running]);
+        app.session_filter = SessionFilterMode::Running;
+
+        let header = &render_text(&app, 60, 40)[0];
+
+        // errored is not running (it is an attention state, not activity) and
+        // the count follows the visible list: three rows pass the filter.
+        assert!(
+            header.ends_with("3 3"),
+            "header should count running|tool-running|waiting sessions among the visible ones, got {header:?}"
         );
     }
 

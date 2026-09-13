@@ -67,6 +67,9 @@ pub enum KillTarget {
     WorktreeGroup(String),
 }
 
+/// How long a footer notice stays visible.
+const NOTICE_DURATION: Duration = Duration::from_millis(2_500);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Modal {
     None,
@@ -106,6 +109,8 @@ pub struct App {
     pub quit_deadline: Option<Instant>,
     pub flash_target: Option<HitTarget>,
     pub flash_deadline: Option<Instant>,
+    /// Short-lived message shown in place of the footer hints.
+    notice: Option<(String, Instant)>,
     pub hover_target: Option<HitTarget>,
     pub modal: Modal,
     pub detail_panel_height: usize,
@@ -152,6 +157,7 @@ impl App {
             quit_deadline: None,
             flash_target: None,
             flash_deadline: None,
+            notice: None,
             hover_target: None,
             modal: Modal::None,
             detail_panel_height: state
@@ -540,7 +546,13 @@ impl App {
                 if self.panel_focus == PanelFocus::Agents {
                     self.dismiss_focused_agent();
                 } else if let Some(name) = self.focused_session_name().map(str::to_string) {
-                    self.commands.push(ClientCommand::HideSession { name });
+                    // The server force-shows the attached session on every
+                    // snapshot, so hiding it would be undone silently (F102).
+                    if self.confirmed_local_session_name() == Some(name.as_str()) {
+                        self.set_notice("the attached session cannot be hidden");
+                    } else {
+                        self.commands.push(ClientCommand::HideSession { name });
+                    }
                 }
             }
             'x' => {
@@ -771,6 +783,17 @@ impl App {
     /// `apply_server_message` stores on `self.theme`.
     pub fn set_theme_request(&mut self, theme: String) {
         self.commands.push(ClientCommand::SetTheme { theme });
+    }
+
+    /// Show a short message in the footer for a couple of seconds.
+    pub fn set_notice(&mut self, text: impl Into<String>) {
+        self.notice = Some((text.into(), Instant::now() + NOTICE_DURATION));
+    }
+
+    /// The footer notice, while it has not expired.
+    pub fn active_notice(&self) -> Option<&str> {
+        let (text, deadline) = self.notice.as_ref()?;
+        (Instant::now() < *deadline).then_some(text.as_str())
     }
 
     /// Arm a 150ms click-flash highlight on the given target. Mirrors the TS
@@ -1414,6 +1437,35 @@ mod tests {
             liveness: None,
             detail: None,
         }
+    }
+
+    #[test]
+    fn hiding_the_attached_session_is_refused_with_a_notice() {
+        let mut state = empty_state(10);
+        state.sessions = vec![
+            session("work", "/tmp/work", false),
+            session("docs", "/tmp/docs", false),
+        ];
+        state.current_session = Some("work".to_string());
+        let mut app = App::from_state(state);
+        app.my_session = Some("work".to_string());
+
+        app.set_sidebar_focus(SidebarFocus::Session("work".to_string()));
+        app.handle_key_char('d');
+        assert!(app.drain_commands().is_empty());
+        assert_eq!(
+            app.active_notice(),
+            Some("the attached session cannot be hidden")
+        );
+
+        app.set_sidebar_focus(SidebarFocus::Session("docs".to_string()));
+        app.handle_key_char('d');
+        assert_eq!(
+            app.drain_commands(),
+            vec![ClientCommand::HideSession {
+                name: "docs".to_string()
+            }]
+        );
     }
 
     #[test]

@@ -111,7 +111,7 @@ fn group_summary(sessions: &[&SessionData]) -> GroupSummary {
     summary
 }
 
-fn session_has_active_agent(session: &SessionData) -> bool {
+pub(crate) fn session_has_active_agent(session: &SessionData) -> bool {
     session
         .agent_state
         .iter()
