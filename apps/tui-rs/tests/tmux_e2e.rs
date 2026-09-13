@@ -459,6 +459,201 @@ fn tmux_sidebar_keeps_session_and_agent_panel_seen_state_in_sync_per_focused_pan
 }
 
 #[test]
+fn tmux_sidebar_shows_claude_registry_sessions_by_name_with_live_status() {
+    let _guard = e2e_serial_guard();
+    let lab = started_lab("opensessions-e2e-claude-registry-status");
+    let sidebar = lab.sidebar_pane("opensessions");
+    let agent_pane = lab.spawn_agent_pane("opensessions", "claude");
+    lab.tmux_ok(["switch-client", "-t", "opensessions"]);
+    lab.tmux_ok(["select-pane", "-t", sidebar.as_str()]);
+
+    // A live session that has not been prompted yet is an idle row.
+    let record = lab.write_claude_registry_record(&agent_pane, "sess-1", "idle", None, "auth work");
+    lab.wait_for_capture_pane(&sidebar, |text| {
+        text.lines().any(|line| line.contains("✓ auth work"))
+            && text.lines().any(|line| line.contains("idle · claude"))
+    });
+
+    record.write("sess-1", "busy", None, "auth work");
+    lab.wait_for_capture_pane(&sidebar, |text| has_spinner_row(text, "auth work"));
+
+    record.write("sess-1", "waiting", Some("dialog open"), "auth work");
+    lab.wait_for_capture_pane(&sidebar, |text| {
+        text.lines().any(|line| line.contains("◉ auth work"))
+            && text
+                .lines()
+                .any(|line| line.contains("blocked (dialog open)"))
+    });
+
+    // The turn ends while the user is looking at the sidebar pane, not the
+    // agent pane: unseen until the agent pane is selected.
+    record.write("sess-1", "idle", None, "auth work");
+    lab.wait_for_capture_pane(&sidebar, |text| {
+        text.lines().any(|line| line.contains("● auth work"))
+            && row_with(text, "opensessions").is_some_and(|row| row.contains('●'))
+    });
+    lab.tmux_ok(["select-pane", "-t", agent_pane.as_str()]);
+    lab.wait_for_capture_pane(&sidebar, |text| {
+        text.lines().any(|line| line.contains("✓ auth work"))
+            && !text.lines().any(|line| line.contains("● auth work"))
+    });
+}
+
+#[test]
+fn tmux_sidebar_drops_claude_registry_rows_whose_pane_or_process_is_gone() {
+    let _guard = e2e_serial_guard();
+    let lab = started_lab("opensessions-e2e-claude-registry-gone");
+    let sidebar = lab.sidebar_pane("opensessions");
+    let agent_pane = lab.spawn_agent_pane("opensessions", "claude");
+    lab.tmux_ok(["switch-client", "-t", "opensessions"]);
+
+    let record = lab.write_claude_registry_record(&agent_pane, "sess-1", "busy", None, "long job");
+    lab.wait_for_capture_pane(&sidebar, |text| {
+        text.lines().any(|line| line.contains("long job"))
+    });
+
+    // Killing the pane kills the process; the record lingers (Claude Code
+    // sweeps it later) but the row must not.
+    lab.tmux_ok(["kill-pane", "-t", agent_pane.as_str()]);
+    lab.wait_for_capture_pane_within(&sidebar, Duration::from_secs(20), |text| {
+        !text.contains("long job")
+    });
+    record.remove();
+}
+
+#[test]
+fn tmux_sidebar_routes_enter_to_the_right_claude_pane_and_follows_session_id_changes() {
+    let _guard = e2e_serial_guard();
+    let lab = started_lab("opensessions-e2e-claude-registry-routing");
+    let sidebar = lab.sidebar_pane("opensessions");
+    let first_pane = lab.spawn_agent_pane("opensessions", "claude");
+    let second_pane = lab.spawn_agent_pane("opensessions", "claude");
+    lab.tmux_ok(["switch-client", "-t", "opensessions"]);
+    lab.tmux_ok(["select-pane", "-t", sidebar.as_str()]);
+
+    let first = lab.write_claude_registry_record(&first_pane, "sess-a", "busy", None, "alpha");
+    let _second = lab.write_claude_registry_record(&second_pane, "sess-b", "busy", None, "beta");
+    lab.wait_for_capture_pane(&sidebar, |text| {
+        text.lines().any(|line| line.contains("alpha"))
+            && text.lines().any(|line| line.contains("beta"))
+    });
+
+    // Two `claude` panes in one session: the old alias heuristic could not
+    // tell them apart; the registry binding can.
+    lab.focus_agent_thread("opensessions", "claude-code", "sess-b");
+    assert_eq!(lab.active_pane(), second_pane);
+    lab.focus_agent_thread("opensessions", "claude-code", "sess-a");
+    assert_eq!(lab.active_pane(), first_pane);
+    lab.tmux_ok(["select-pane", "-t", sidebar.as_str()]);
+
+    // `/clear` in the first pane: same process, new session id.
+    first.write("sess-a2", "idle", None, "fresh start");
+    lab.wait_for_capture_pane(&sidebar, |text| {
+        text.lines().any(|line| line.contains("✓ fresh start"))
+            && !text.contains("alpha")
+            && text.lines().any(|line| line.contains("beta"))
+    });
+
+    // Renaming the tmux session leaves the recorded session name stale; the
+    // pane id still identifies the row.
+    lab.tmux_ok(["rename-session", "-t", "opensessions", "renamed"]);
+    let sidebar = lab.sidebar_pane("renamed");
+    lab.wait_for_capture_pane(&sidebar, |text| {
+        // The session row keeps both badges: beta still running (spinner)
+        // and the fresh idle session (✓).
+        row_with(text, "renamed")
+            .is_some_and(|row| row.contains('✓') && row.chars().any(|ch| ('⠀'..='⣿').contains(&ch)))
+    });
+}
+
+#[test]
+fn tmux_sidebar_ignores_claude_registry_records_from_other_tmux_servers() {
+    let _guard = e2e_serial_guard();
+    let lab = started_lab("opensessions-e2e-claude-registry-foreign");
+    let sidebar = lab.sidebar_pane("opensessions");
+    let agent_pane = lab.spawn_agent_pane("opensessions", "claude");
+    lab.tmux_ok(["switch-client", "-t", "opensessions"]);
+
+    // A record whose pane id exists here but whose process is not inside
+    // that pane (this test process) describes some other tmux server.
+    let record = ClaudeRecordHandle {
+        path: lab
+            .claude_registry_dir()
+            .join(format!("{}.json", std::process::id())),
+        pid: std::process::id(),
+        tmux_target: lab.tmux([
+            "display-message",
+            "-p",
+            "-t",
+            agent_pane.as_str(),
+            "#{session_name}:#{window_id}.#{pane_id}",
+        ]),
+        cwd: lab.root.join("opensessions").to_string_lossy().to_string(),
+    };
+    record.write("foreign-1", "busy", None, "not ours");
+    let genuine = lab.write_claude_registry_record(&agent_pane, "ours-1", "busy", None, "ours");
+
+    lab.wait_for_capture_pane(&sidebar, |text| {
+        text.lines().any(|line| line.contains("ours"))
+    });
+    sleep(Duration::from_millis(1_500));
+    let capture = lab.capture_pane(&sidebar);
+    assert!(
+        !capture.contains("not ours"),
+        "a record from another tmux server must not become a row:\n{capture}"
+    );
+    record.remove();
+    genuine.remove();
+}
+
+#[test]
+fn tmux_sidebar_keeps_http_agent_rows_while_their_pane_lives_and_accepts_second_timestamps() {
+    let _guard = e2e_serial_guard();
+    let lab = started_lab("opensessions-e2e-http-agent-pane-liveness");
+    let sidebar = lab.sidebar_pane("opensessions");
+    // A custom agent nobody has an alias for, in a pane titled after it.
+    let agent_pane = lab.spawn_agent_pane("opensessions", "my-deploy-bot");
+    lab.tmux_ok(["switch-client", "-t", "opensessions"]);
+    lab.tmux_ok(["select-pane", "-t", sidebar.as_str()]);
+
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    post_body(
+        lab.port,
+        "/api/agent-event",
+        "application/json",
+        &serde_json::json!({
+            "agent": "deploy-bot",
+            "status": "done",
+            "tmuxSession": "opensessions",
+            "threadId": "deploy-1",
+            "threadName": "Deploy prod",
+            "paneId": agent_pane,
+            "ts": seconds,
+        })
+        .to_string(),
+    );
+    lab.wait_for_capture_pane(&sidebar, |text| {
+        text.lines().any(|line| line.contains("● Deploy prod"))
+    });
+
+    // Well past the 10 s exit grace: the pane is alive, so the row stays.
+    sleep(Duration::from_secs(12));
+    assert!(
+        lab.capture_pane(&sidebar).contains("Deploy prod"),
+        "a done row whose pane is alive must not be reaped:\n{}",
+        lab.capture_pane(&sidebar)
+    );
+
+    lab.tmux_ok(["kill-pane", "-t", agent_pane.as_str()]);
+    lab.wait_for_capture_pane_within(&sidebar, Duration::from_secs(20), |text| {
+        !text.contains("Deploy prod")
+    });
+}
+
+#[test]
 fn tmux_sidebar_width_is_fixed_and_rejects_manual_sidebar_resize() {
     let _guard = e2e_serial_guard();
     let lab = started_lab("opensessions-e2e-width");
@@ -855,6 +1050,66 @@ fn tmux_sidebar_switch_latency_during_width_repair_probe() {
     );
 }
 
+/// A registry record the test controls; rewriting it is what a live
+/// `claude` does on every status change.
+struct ClaudeRecordHandle {
+    path: PathBuf,
+    pid: u32,
+    tmux_target: String,
+    cwd: String,
+}
+
+impl ClaudeRecordHandle {
+    fn write(&self, session_id: &str, status: &str, waiting_for: Option<&str>, name: &str) {
+        self.write_with_target(session_id, status, waiting_for, name, &self.tmux_target);
+    }
+
+    fn write_with_target(
+        &self,
+        session_id: &str,
+        status: &str,
+        waiting_for: Option<&str>,
+        name: &str,
+        tmux_target: &str,
+    ) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_millis() as u64;
+        let mut record = serde_json::json!({
+            "pid": self.pid,
+            "sessionId": session_id,
+            "cwd": self.cwd,
+            "startedAt": now - 60_000,
+            "version": "2.1.270",
+            "kind": "interactive",
+            "entrypoint": "cli",
+            "tmux": tmux_target,
+            "name": name,
+            "nameSource": "user",
+            "status": status,
+            "updatedAt": now,
+            "statusUpdatedAt": now,
+        });
+        if let Some(waiting_for) = waiting_for {
+            record["waitingFor"] = serde_json::Value::String(waiting_for.to_string());
+        }
+        fs::create_dir_all(self.path.parent().expect("registry dir")).expect("registry dir");
+        // Write-then-rename, as Claude Code does, so a reader never sees a
+        // half-written record.
+        let tmp = self.path.with_extension("json.tmp");
+        fs::write(&tmp, record.to_string()).expect("write registry record");
+        fs::rename(&tmp, &self.path).expect("publish registry record");
+        // Registry writes are deduped by status stamp; make sure consecutive
+        // writes in a test get distinct stamps.
+        sleep(Duration::from_millis(5));
+    }
+
+    fn remove(&self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 fn started_lab(prefix: &str) -> Lab {
     Command::new("tmux")
         .arg("-V")
@@ -882,6 +1137,17 @@ fn e2e_serial_guard() -> MutexGuard<'static, ()> {
     LOCK.get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Whether some line shows `name` behind a spinner frame (the sidebar
+/// animates the spinner, so a capture may land on any frame).
+fn has_spinner_row(text: &str, name: &str) -> bool {
+    const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    text.lines().any(|line| {
+        FRAMES
+            .iter()
+            .any(|frame| line.contains(&format!("{frame} {name}")))
+    })
 }
 
 fn row_with<'a>(text: &'a str, needle: &str) -> Option<&'a str> {
@@ -1370,6 +1636,96 @@ time.sleep(300)
             ws.close().await.expect("close focus-agent ws client");
             tokio::time::sleep(Duration::from_millis(100)).await;
         });
+    }
+
+    /// Focus an agent row's pane the way Enter does, without naming the
+    /// pane: the server has to resolve it from its own binding.
+    fn focus_agent_thread(&self, session: &str, agent: &str, thread_id: &str) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .expect("build e2e tokio runtime");
+
+        runtime.block_on(async {
+            let mut ws = opensessions_sidebar::client::connect_ws("127.0.0.1", self.port)
+                .await
+                .expect("connect focus-agent ws client");
+            let _ = ws.next().await.expect("read ws hello").expect("ws hello");
+            let _ = ws
+                .next()
+                .await
+                .expect("read ws initial state")
+                .expect("ws initial state");
+            let command = serde_json::json!({
+                "type": "focus-agent-pane",
+                "session": session,
+                "agent": agent,
+                "threadId": thread_id,
+            });
+            ws.send(Message::text(command.to_string()))
+                .await
+                .expect("send focus-agent-pane command");
+            ws.close().await.expect("close focus-agent ws client");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+    }
+
+    fn pane_pid(&self, pane: &str) -> u32 {
+        self.tmux(["display-message", "-p", "-t", pane, "#{pane_pid}"])
+            .parse()
+            .expect("pane pid")
+    }
+
+    fn claude_registry_dir(&self) -> PathBuf {
+        self.home_dir().join(".claude/sessions")
+    }
+
+    /// Write a Claude Code session registry record for `pane`, as the
+    /// `claude` process running there would: the pane's shell pid stands in
+    /// for the claude process (it is alive and inside the pane).
+    fn write_claude_registry_record(
+        &self,
+        pane: &str,
+        session_id: &str,
+        status: &str,
+        waiting_for: Option<&str>,
+        name: &str,
+    ) -> ClaudeRecordHandle {
+        let pid = self.pane_pid(pane);
+        let tmux_target = self.tmux([
+            "display-message",
+            "-p",
+            "-t",
+            pane,
+            "#{session_name}:#{window_id}.#{pane_id}",
+        ]);
+        let handle = ClaudeRecordHandle {
+            path: self.claude_registry_dir().join(format!("{pid}.json")),
+            pid,
+            tmux_target,
+            cwd: self.root.join("opensessions").to_string_lossy().to_string(),
+        };
+        handle.write(session_id, status, waiting_for, name);
+        handle
+    }
+
+    fn wait_for_capture_pane_within<F>(&self, pane: &str, timeout: Duration, predicate: F)
+    where
+        F: Fn(&str) -> bool,
+    {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if predicate(&self.capture_pane(pane)) {
+                return;
+            }
+            sleep(Duration::from_millis(200));
+        }
+        panic!(
+            "timed out waiting for pane {pane}; last capture:\n{}\n\nlogs:\n{}",
+            self.capture_pane(pane),
+            self.logs(),
+        );
     }
 
     fn wait_for_text(&self, session: &str, text: &str) {
