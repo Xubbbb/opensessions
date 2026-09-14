@@ -178,7 +178,7 @@ For the full tmux workflow with keybindings, troubleshooting, and configuration 
 
 - Session ordering is persisted in `~/.config/opensessions/session-order.json`.
 - Amp watcher reads `~/.local/share/amp/threads/*.json`.
-- Claude Code sessions come from the registry Claude Code keeps in `~/.claude/sessions/` (also `$CLAUDE_CONFIG_DIR/sessions/` and any sibling `~/.claude*/sessions/`, so multiple accounts show up); their transcripts under the matching `projects/` directory add the title and last prompt and are the fallback for older Claude versions.
+- Claude Code sessions come from the registry Claude Code (2.1 and later) keeps in `~/.claude/sessions/` (also `$CLAUDE_CONFIG_DIR/sessions/` and any sibling `~/.claude*/sessions/`, so multiple accounts show up); their transcripts under the matching `projects/` directory only add the title and last prompt.
 - Codex watcher reads transcript JSONL files in `~/.codex/sessions/` or `$CODEX_HOME/sessions/` and resolves sessions from `turn_context.cwd`.
 - OpenCode watcher polls the SQLite database in `~/.local/share/opencode/opencode.db`.
 - Toggling the sidebar off closes its panes; `prefix o → e` briefly parks the sidebar pane in a tmux session named `_os_stash` while it re-lays out the window.

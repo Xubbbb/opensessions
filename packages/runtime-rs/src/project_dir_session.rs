@@ -24,8 +24,8 @@ pub fn build_dir_session_map(
 
 /// Resolve `project_dir` to one session: an exact directory match wins,
 /// then sessions rooted below it together with the sessions of its deepest
-/// ancestor directory, then the encoded-folder fallback. A stage that
-/// matches several sessions resolves to none of them.
+/// ancestor directory. A stage that matches several sessions resolves to
+/// none of them.
 pub fn resolve_session_for_project_dir(
     project_dir: &str,
     dir_session_map: &DirSessionMap,
@@ -63,20 +63,7 @@ pub fn resolve_session_for_project_dir_preferring(
     if let Some((_, sessions)) = deepest_ancestor {
         related_matches.extend(sessions.iter().cloned());
     }
-    if !related_matches.is_empty() {
-        return settle(related_matches, preferred);
-    }
-
-    let encoded = project_dir.strip_prefix("__encoded__:")?;
-
-    let mut encoded_matches = BTreeSet::new();
-    for (dir, sessions) in dir_session_map {
-        if encode_project_dir(dir) != encoded {
-            continue;
-        }
-        encoded_matches.extend(sessions.iter().cloned());
-    }
-    settle(encoded_matches, preferred)
+    settle(related_matches, preferred)
 }
 
 fn settle(matches: BTreeSet<String>, preferred: &HashSet<String>) -> Option<String> {
@@ -88,18 +75,6 @@ fn settle(matches: BTreeSet<String>, preferred: &HashSet<String>) -> Option<Stri
         .filter(|session| preferred.contains(session));
     let winner = preferred_matches.next()?;
     preferred_matches.next().is_none().then_some(winner)
-}
-
-fn encode_project_dir(dir: &str) -> String {
-    dir.chars()
-        .map(|ch| {
-            if matches!(ch, '/' | '.' | '_') {
-                '-'
-            } else {
-                ch
-            }
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -181,19 +156,6 @@ mod tests {
         );
         assert_eq!(
             resolve_session_for_project_dir_preferring("/repo", &sessions, &preferred(&["other"])),
-            None
-        );
-    }
-
-    #[test]
-    fn encoded_fallback_matches_the_dashed_folder_name() {
-        let sessions = map(&[("app", "/home/me/my_app.v2")]);
-        assert_eq!(
-            resolve_session_for_project_dir("__encoded__:-home-me-my-app-v2", &sessions).as_deref(),
-            Some("app")
-        );
-        assert_eq!(
-            resolve_session_for_project_dir("__encoded__:-home-me-other", &sessions),
             None
         );
     }

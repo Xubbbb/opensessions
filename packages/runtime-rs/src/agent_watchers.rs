@@ -1,12 +1,8 @@
-use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
-
 use serde_json::Value;
 
 use crate::agent_parsers::{
     determine_amp_message_status, determine_codex_status, determine_opencode_status,
 };
-use crate::claude_registry::claude_code_config_dirs_from;
 use crate::protocol::AgentStatus;
 use crate::tracker::{LastEntry, TranscriptHint};
 use crate::transcript_tail::TailState;
@@ -57,37 +53,17 @@ pub fn amp_snapshot_from_thread_json(raw: &str, ts: u64) -> Option<AgentWatcherS
     })
 }
 
-/// Whole-file convenience over `ClaudeTranscriptState`; the server keeps
-/// per-file states in a `TailCache` and only feeds appended lines.
-pub fn claude_code_snapshot_from_jsonl(
-    thread_id: &str,
-    project_dir: &str,
-    raw: &str,
-    mtime_ms: u64,
-    now_ms: u64,
-) -> Option<AgentWatcherSnapshot> {
-    let mut state = ClaudeTranscriptState::default();
-    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
-        state.apply_line(line);
-    }
-    state.snapshot(thread_id, project_dir, mtime_ms, now_ms)
-}
-
-/// Incremental parse state of one Claude Code transcript.
+/// Incremental parse state of one Claude Code transcript. It only enriches
+/// the registry row of a live session (title, last prompt, what the last
+/// entry was); Claude Code rows are never created from transcripts.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClaudeTranscriptState {
-    pub session_id: Option<String>,
-    /// Working directory recorded on the entries themselves; more reliable
-    /// than decoding the project folder name.
-    pub cwd: Option<String>,
     custom_title: Option<String>,
     first_prompt_name: Option<String>,
     /// Claude Code's own `last-prompt` record, when present.
     last_prompt_record: Option<String>,
     last_user_prompt: Option<String>,
-    status: Option<AgentStatus>,
     last_entry: Option<LastEntry>,
-    saw_entry: bool,
 }
 
 impl TailState for ClaudeTranscriptState {
@@ -125,21 +101,6 @@ impl ClaudeTranscriptState {
             // about the conversation's state.
             return;
         };
-        self.saw_entry = true;
-        if self.session_id.is_none() {
-            self.session_id = entry
-                .get("sessionId")
-                .and_then(Value::as_str)
-                .filter(|id| !id.is_empty())
-                .map(ToString::to_string);
-        }
-        if self.cwd.is_none() {
-            self.cwd = entry
-                .get("cwd")
-                .and_then(Value::as_str)
-                .filter(|cwd| !cwd.is_empty())
-                .map(ToString::to_string);
-        }
         // Injected context (/context output, skill bodies, command output)
         // and compaction summaries are not prompts and carry no status (F040).
         if entry.get("isMeta") == Some(&Value::Bool(true))
@@ -156,14 +117,10 @@ impl ClaudeTranscriptState {
                     .is_some_and(|text| text.starts_with("[Request interrupted"))
                 {
                     self.last_entry = Some(LastEntry::Interrupted);
-                    self.status = Some(AgentStatus::Interrupted);
                 } else if content_has_type(content, "tool_result") {
                     self.last_entry = Some(LastEntry::ToolResult);
-                    self.status = Some(AgentStatus::Running);
                 } else if let Some(text) = text {
-                    if text.contains("<command-name>/exit</command-name>") {
-                        self.status = Some(AgentStatus::Done);
-                    } else if text.contains("<command-name>/")
+                    if text.contains("<command-name>/")
                         || is_noise_user_text(&text)
                         || text.starts_with("[Request")
                     {
@@ -174,33 +131,23 @@ impl ClaudeTranscriptState {
                         }
                         self.last_user_prompt = Some(prompt);
                         self.last_entry = Some(LastEntry::UserPrompt);
-                        self.status = Some(AgentStatus::Running);
                     }
                 } else {
                     self.last_entry = Some(LastEntry::UserPrompt);
-                    self.status = Some(AgentStatus::Running);
                 }
             }
             "assistant" => {
                 if entry.get("isApiErrorMessage") == Some(&Value::Bool(true)) {
                     self.last_entry = Some(LastEntry::ApiError);
-                    self.status = Some(AgentStatus::Error);
                 } else if content_has_type(content, "tool_use") {
                     self.last_entry = Some(LastEntry::AssistantToolUse);
-                    self.status = Some(AgentStatus::Running);
                 } else {
                     match entry
                         .pointer("/message/stop_reason")
                         .and_then(Value::as_str)
                     {
-                        None | Some("tool_use") => {
-                            self.last_entry = Some(LastEntry::Other);
-                            self.status = Some(AgentStatus::Running);
-                        }
-                        Some(_) => {
-                            self.last_entry = Some(LastEntry::AssistantEndTurn);
-                            self.status = Some(AgentStatus::Done);
-                        }
+                        None | Some("tool_use") => self.last_entry = Some(LastEntry::Other),
+                        Some(_) => self.last_entry = Some(LastEntry::AssistantEndTurn),
                     }
                 }
             }
@@ -227,44 +174,6 @@ impl ClaudeTranscriptState {
             last_user_prompt: self.last_user_prompt(),
             last_entry: self.last_entry.unwrap_or(LastEntry::Other),
         }
-    }
-
-    /// Fallback snapshot for sessions without a registry record: status is
-    /// inferred from the last entry plus silence timers.
-    pub fn snapshot(
-        &self,
-        thread_id: &str,
-        project_dir_fallback: &str,
-        mtime_ms: u64,
-        now_ms: u64,
-    ) -> Option<AgentWatcherSnapshot> {
-        if !self.saw_entry {
-            return None;
-        }
-        let mut status = self.status.unwrap_or(AgentStatus::Idle);
-        let idle_for = now_ms.saturating_sub(mtime_ms);
-        if status == AgentStatus::Running
-            && self.last_entry == Some(LastEntry::AssistantToolUse)
-            && idle_for >= TOOL_USE_WAIT_MS
-        {
-            status = AgentStatus::Waiting;
-        }
-        if matches!(status, AgentStatus::Running | AgentStatus::Waiting) && idle_for >= STUCK_MS {
-            status = AgentStatus::Stale;
-        }
-        Some(AgentWatcherSnapshot {
-            agent: "claude-code",
-            thread_id: Some(thread_id.to_string()),
-            thread_name: self.thread_name(),
-            last_user_prompt: self.last_user_prompt(),
-            project_dir: Some(
-                self.cwd
-                    .clone()
-                    .unwrap_or_else(|| project_dir_fallback.to_string()),
-            ),
-            status,
-            ts: mtime_ms,
-        })
     }
 }
 
@@ -550,28 +459,6 @@ pub fn codex_thread_id_from_path(path: &str) -> String {
     find_uuid_suffix(name).unwrap_or(name).to_string()
 }
 
-/// Every `projects/` directory Claude Code may write transcripts into: one
-/// per config directory (see `claude_registry::claude_code_config_dirs`).
-pub fn claude_code_projects_dirs(home: &Path) -> Vec<PathBuf> {
-    claude_code_projects_dirs_from(home, std::env::var_os("CLAUDE_CONFIG_DIR").as_deref())
-}
-
-fn claude_code_projects_dirs_from(home: &Path, config_dir: Option<&OsStr>) -> Vec<PathBuf> {
-    claude_code_config_dirs_from(home, config_dir)
-        .into_iter()
-        .map(|dir| dir.join("projects"))
-        .collect()
-}
-
-pub fn decode_claude_project_dir(encoded: &str, exists: impl Fn(&str) -> bool) -> String {
-    let naive = encoded.replace('-', "/");
-    if exists(&naive) {
-        naive
-    } else {
-        format!("__encoded__:{encoded}")
-    }
-}
-
 pub fn parse_codex_session_index(raw: &str) -> Vec<(String, String)> {
     raw.lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -852,19 +739,7 @@ fn is_uuid(candidate: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
     use super::*;
-
-    fn scratch_home(name: &str) -> PathBuf {
-        let home = std::env::temp_dir().join(format!(
-            "opensessions-claude-dirs-{name}-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&home);
-        fs::create_dir_all(&home).expect("create scratch home");
-        home
-    }
 
     #[test]
     fn uuid_suffix_search_tolerates_non_ascii_file_names() {
@@ -880,68 +755,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_projects_dirs_include_the_config_dir_override_and_siblings() {
-        let home = scratch_home("siblings");
-        fs::create_dir_all(home.join(".claude/projects")).unwrap();
-        fs::create_dir_all(home.join(".claude-personal/projects")).unwrap();
-        fs::create_dir_all(home.join(".claude-empty")).unwrap();
-        fs::write(home.join(".claude.json"), "{}").unwrap();
-        fs::create_dir_all(home.join(".not-claude/projects")).unwrap();
-
-        let dirs = claude_code_projects_dirs_from(&home, Some(OsStr::new("~/.claude-work")));
-
-        assert_eq!(
-            dirs,
-            vec![
-                home.join(".claude/projects"),
-                home.join(".claude-work/projects"),
-                home.join(".claude-personal/projects"),
-            ]
-        );
-        let _ = fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn claude_projects_dirs_deduplicate_override_that_is_also_a_sibling() {
-        let home = scratch_home("dedupe");
-        fs::create_dir_all(home.join(".claude-personal/projects")).unwrap();
-
-        let dirs =
-            claude_code_projects_dirs_from(&home, Some(home.join(".claude-personal").as_os_str()));
-
-        assert_eq!(
-            dirs,
-            vec![
-                home.join(".claude/projects"),
-                home.join(".claude-personal/projects"),
-            ]
-        );
-        assert_eq!(
-            claude_code_projects_dirs_from(&home, Some(OsStr::new(""))),
-            vec![
-                home.join(".claude/projects"),
-                home.join(".claude-personal/projects"),
-            ]
-        );
-        let _ = fs::remove_dir_all(&home);
-    }
-
-    #[test]
-    fn claude_code_snapshot_tracks_latest_real_user_prompt() {
-        let raw = r#"
-{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Implement auth"}]}}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Done"}],"stop_reason":"end_turn"}}
-{"type":"user","message":{"role":"user","content":[{"type":"text","text":"Add tests too"}]}}
-"#;
-        let snapshot = claude_code_snapshot_from_jsonl("thread", "/repo", raw, 1_000, 1_100)
-            .expect("snapshot");
-        assert_eq!(snapshot.thread_name.as_deref(), Some("Implement auth"));
-        assert_eq!(snapshot.last_user_prompt.as_deref(), Some("Add tests too"));
-        assert_eq!(snapshot.status, AgentStatus::Running);
-    }
-
-    #[test]
-    fn claude_state_skips_meta_entries_prefers_last_prompt_records_and_reads_cwd() {
+    fn claude_state_skips_meta_entries_and_prefers_last_prompt_records() {
         let raw = r#"
 {"type":"user","cwd":"/repo/sub","sessionId":"s1","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>noise"}}
 {"type":"user","cwd":"/repo/sub","sessionId":"s1","message":{"role":"user","content":"Implement auth"}}
@@ -957,19 +771,10 @@ mod tests {
             state.apply_line(line);
         }
 
-        assert_eq!(state.cwd.as_deref(), Some("/repo/sub"));
-        assert_eq!(state.session_id.as_deref(), Some("s1"));
         let hint = state.hint();
         assert_eq!(hint.thread_name.as_deref(), Some("auth work"));
         assert_eq!(hint.last_user_prompt.as_deref(), Some("Implement auth"));
         assert_eq!(hint.last_entry, LastEntry::AssistantEndTurn);
-
-        let snapshot = state
-            .snapshot("s1", "/decoded/fallback", 1_000, 1_100)
-            .expect("snapshot");
-        assert_eq!(snapshot.project_dir.as_deref(), Some("/repo/sub"));
-        assert_eq!(snapshot.thread_name.as_deref(), Some("auth work"));
-        assert_eq!(snapshot.status, AgentStatus::Done);
     }
 
     #[test]
@@ -1017,50 +822,20 @@ mod tests {
             r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"[Request interrupted by user]"}]}}"#,
         );
         assert_eq!(state.hint().last_entry, LastEntry::Interrupted);
-        assert_eq!(
-            state.snapshot("s", "/r", 1, 2).unwrap().status,
-            AgentStatus::Interrupted
-        );
 
         apply(
             &mut state,
             r#"{"type":"assistant","isApiErrorMessage":true,"message":{"role":"assistant","content":[{"type":"text","text":"API Error: overloaded"}]}}"#,
         );
         assert_eq!(state.hint().last_entry, LastEntry::ApiError);
-        assert_eq!(
-            state.snapshot("s", "/r", 1, 2).unwrap().status,
-            AgentStatus::Error
-        );
 
+        // Slash commands are neither prompts nor conversation entries.
         apply(
             &mut state,
             r#"{"type":"user","message":{"role":"user","content":"<command-name>/exit</command-name>"}}"#,
         );
-        assert_eq!(
-            state.snapshot("s", "/r", 1, 2).unwrap().status,
-            AgentStatus::Done
-        );
-    }
-
-    #[test]
-    fn claude_state_promotes_silence_to_waiting_and_stale_only_for_the_fallback_snapshot() {
-        let mut state = ClaudeTranscriptState::default();
-        state.apply_line(r#"{"type":"user","message":{"role":"user","content":"go"}}"#);
-        state.apply_line(r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"tool_use","name":"Bash"}]}}"#);
-
-        assert_eq!(
-            state.snapshot("s", "/r", 1_000, 2_000).unwrap().status,
-            AgentStatus::Running
-        );
-        assert_eq!(
-            state.snapshot("s", "/r", 1_000, 5_000).unwrap().status,
-            AgentStatus::Waiting
-        );
-        assert_eq!(
-            state.snapshot("s", "/r", 1_000, 20_000).unwrap().status,
-            AgentStatus::Stale
-        );
-        assert_eq!(state.hint().last_entry, LastEntry::AssistantToolUse);
+        assert_eq!(state.hint().last_entry, LastEntry::ApiError);
+        assert_eq!(state.hint().last_user_prompt.as_deref(), Some("Fix it"));
     }
 
     #[test]
