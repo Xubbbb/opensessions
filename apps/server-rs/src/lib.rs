@@ -1275,7 +1275,7 @@ impl StateSource for ReadOnlyMuxStateSource {
             "/ensure-sidebar" => {
                 let spawned = self.ensure_sidebar(body);
                 self.parse_hook_context(body)
-                    .map(|context| activate_session_json(context.session, None))
+                    .map(|context| activate_session_json(context.session, None, false))
                     .or_else(|| spawned.then(|| self.snapshot_json()))
             }
             "/pane-exited" | "/pane-died" => {
@@ -1793,6 +1793,8 @@ impl ReadOnlyMuxStateSource {
         spawned
     }
 
+    /// Switch to the Nth visible session. Returns the activation to
+    /// broadcast: the user chose that session, so its sidebar selects it.
     fn switch_visible_index(&self, index: u32, client_tty: Option<&str>) -> Option<String> {
         let provider = self.providers.first()?;
         let target_index = index.checked_sub(1).map(|index| index as usize)?;
@@ -1800,7 +1802,7 @@ impl ReadOnlyMuxStateSource {
             .sidebar_display_session_names()
             .and_then(|names| names.get(target_index).cloned())?;
         provider.switch_session(&name, client_tty);
-        None
+        Some(activate_session_json(name, None, true))
     }
 
     fn sidebar_display_session_names(&self) -> Option<Vec<String>> {
@@ -2608,10 +2610,11 @@ fn json_string_or_null(value: Option<&str>) -> String {
         .unwrap_or_else(|| "null".to_string())
 }
 
-fn activate_session_json(name: String, source_pane_id: Option<&str>) -> String {
+fn activate_session_json(name: String, source_pane_id: Option<&str>, chosen: bool) -> String {
     serde_json::to_string(&SidebarServerMessage::ActivateSession {
         name,
         source_pane_id: source_pane_id.map(str::to_string),
+        chosen,
     })
     .expect("activate-session must serialize")
 }
@@ -3002,8 +3005,10 @@ async fn handle_connection(
             return Ok(());
         };
         let body = String::from_utf8_lossy(http_body(&request));
-        if let Some(state_source) = &state_source {
-            let _ = state_source.handle_switch_index(index, &body);
+        if let Some(state_source) = &state_source
+            && let Some(payload) = state_source.handle_switch_index(index, &body)
+        {
+            let _ = state_updates.send(payload);
         }
         stream
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
@@ -3240,6 +3245,7 @@ async fn handle_connection(
                                     let _ = state_updates.send(activate_session_json(
                                         name,
                                         client_context.pane_id.as_deref(),
+                                        true,
                                     ));
                                     tokio::task::yield_now().await;
                                 }

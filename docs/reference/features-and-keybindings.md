@@ -29,7 +29,7 @@ Clicking a detected port opens `http://localhost:<port>`.
 
 - Multiple agent instances per session when a watcher emits `threadId`
 - Per-instance unseen tracking: a finished agent keeps its `●` until its pane is the active pane of an attached tmux client, until you `Enter` it, or until the session is marked seen
-- The selected row is yours: it only moves when you move it or when its row disappears — coming back to a session does not reset its sidebar's selection (the current session is marked with `▌`, the selected row with `›`)
+- The selected row is yours: it moves when you move it, when you pick a session (Enter, click, `1`–`9`, the index keys: the sidebar you arrive in then shows that session selected), or when its row disappears. A plain tmux switch back to a session leaves its sidebar's selection where you put it. The current session is marked with `▌`, the selected row with `›`.
 - Status values: `idle`, `running`, `tool-running`, `done`, `error`, `waiting`, `interrupted`, `stale`; a qualifier in parentheses adds the reason when there is one (`working (delegating)` while background subagents run, `blocked (dialog open)`, `done (shell running)`)
 - Live Claude Code sessions are rows even while idle (`✓ idle`), named after their `/rename` name
 - Agents are removed automatically about 10 seconds after their tmux pane or process disappears, whatever their status. Agents that never had a pane are dropped after 5 minutes once seen or 30 minutes while still unseen when finished, and after 30 minutes of silence otherwise. `d` in the agents panel removes one immediately.

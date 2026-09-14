@@ -315,6 +315,7 @@ impl App {
             ServerMessage::ActivateSession {
                 name,
                 source_pane_id,
+                chosen,
             } => {
                 let previous_activated = self.last_activated_session.replace(name.clone());
                 let from_this_pane = self
@@ -326,13 +327,16 @@ impl App {
                             .map(|source| source == &identity.pane_id)
                     })
                     .unwrap_or(false);
-                // The client came (back) to this sidebar's session. The row
-                // the user selected here stays selected: a selection is only
-                // changed by the user or when its row disappears.
-                if !from_this_pane
-                    && self.confirmed_local_session_name() == Some(name.as_str())
-                    && previous_activated.as_deref() != Some(name.as_str())
-                {
+                if from_this_pane || self.confirmed_local_session_name() != Some(name.as_str()) {
+                    return;
+                }
+                // The user picked this session (in another sidebar, or with an
+                // index key): show it selected here, as the row they chose.
+                // A client merely arriving here (a tmux switch) leaves the
+                // selection where the user put it.
+                if chosen {
+                    self.confirm_local_session(name, true);
+                } else if previous_activated.as_deref() != Some(name.as_str()) {
                     self.confirm_local_session(name, false);
                 }
             }
@@ -1480,19 +1484,42 @@ mod tests {
 
         app.set_sidebar_focus(SidebarFocus::Session("docs".to_string()));
 
-        // The client leaves for another session and comes back.
+        // The client leaves for another session and comes back through tmux.
         app.apply_server_message(ServerMessage::ActivateSession {
             name: "other".to_string(),
             source_pane_id: None,
+            chosen: false,
         });
         app.apply_server_message(ServerMessage::ActivateSession {
             name: "work".to_string(),
             source_pane_id: None,
+            chosen: false,
         });
-        app.apply_server_message(ServerMessage::State(state));
+        app.apply_server_message(ServerMessage::State(state.clone()));
 
         assert_eq!(app.focused_session_name(), Some("docs"));
         assert_eq!(app.my_session.as_deref(), Some("work"));
+
+        // The user picks this session in another sidebar (or by index key):
+        // the row they chose is the one shown selected here.
+        app.apply_server_message(ServerMessage::ActivateSession {
+            name: "work".to_string(),
+            source_pane_id: Some("%99".to_string()),
+            chosen: true,
+        });
+        assert_eq!(app.focused_session_name(), Some("work"));
+
+        // The sidebar that sent the switch does not react to its own echo.
+        app.set_pane_identity("%1".to_string(), "work".to_string(), Some("@1".to_string()));
+        app.set_sidebar_focus(SidebarFocus::Session("docs".to_string()));
+        app.apply_server_message(ServerMessage::ActivateSession {
+            name: "work".to_string(),
+            source_pane_id: Some("%1".to_string()),
+            chosen: true,
+        });
+        assert_eq!(app.focused_session_name(), Some("docs"));
+        app.apply_server_message(ServerMessage::State(state));
+        assert_eq!(app.focused_session_name(), Some("docs"));
     }
 
     #[test]

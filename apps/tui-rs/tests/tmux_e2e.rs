@@ -293,21 +293,26 @@ fn tmux_sidebar_keeps_the_selected_row_when_the_client_returns_to_the_session() 
         );
     }
 
-    // Leaving through the sidebar selects the destination; returning through
-    // another sidebar leaves that selection alone too.
+    // Leaving through the sidebar selects the destination there. Picking
+    // opensessions in another sidebar is a choice: the sidebars back in
+    // opensessions select it, replacing the earlier selection, so the row
+    // the user chose is the one they see selected on arrival.
     lab.tmux_ok(["send-keys", "-t", source.as_str(), "1"]);
     lab.wait_for_client_session("effect-ts");
     let effect = lab.sidebar_pane("effect-ts");
+    lab.wait_for_capture_pane(&effect, |text| {
+        row_with(text, "effect-ts").is_some_and(|row| row.contains("▌"))
+            && !has_non_active_focus_marker(text, "effect-ts")
+    });
     lab.tmux_ok(["select-pane", "-t", effect.as_str()]);
     lab.click_session_row(&effect, "opensessions");
     lab.wait_for_client_session("opensessions");
-    sleep(Duration::from_millis(700));
-    let capture = lab.capture_pane(&source);
-    assert!(
-        row_with(&capture, "effect-ts").is_some_and(|row| row.starts_with('›'))
-            && row_with(&capture, "opensessions").is_some_and(|row| row.contains("▌")),
-        "the destination picked in this sidebar stays selected after returning; got:\n{capture}",
-    );
+    for pane in [&source, &second] {
+        lab.wait_for_capture_pane(pane, |text| {
+            row_with(text, "opensessions").is_some_and(|row| row.contains("▌"))
+                && !has_non_active_focus_marker(text, "opensessions")
+        });
+    }
 }
 
 #[test]

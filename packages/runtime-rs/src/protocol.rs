@@ -23,10 +23,15 @@ pub enum ServerMessage {
         name: String,
         client_tty: Option<String>,
     },
+    /// The client is (about to be) in `name`. `chosen` is true when the user
+    /// picked that session in a sidebar or with an index key, false when tmux
+    /// reported a client arriving there by other means.
     ActivateSession {
         name: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         source_pane_id: Option<String>,
+        #[serde(default)]
+        chosen: bool,
     },
     ReIdentify,
 }
