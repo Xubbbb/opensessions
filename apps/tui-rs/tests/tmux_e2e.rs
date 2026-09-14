@@ -245,9 +245,9 @@ fn tmux_sidebar_reorders_normal_session_across_worktree_group_boundary() {
 }
 
 #[test]
-fn tmux_sidebar_rehomes_stale_focus_when_returning_to_session() {
+fn tmux_sidebar_keeps_the_selected_row_when_the_client_returns_to_the_session() {
     let _guard = e2e_serial_guard();
-    let lab = started_lab("opensessions-e2e-rehome-return-focus");
+    let lab = started_lab("opensessions-e2e-sticky-selection");
     let second_window = lab.spawn_window_with_sidebar("opensessions", "second-sidebar");
     let source = lab.sidebar_pane("opensessions");
     let second = lab.sidebar_pane_in_window("opensessions", &second_window);
@@ -260,40 +260,54 @@ fn tmux_sidebar_rehomes_stale_focus_when_returning_to_session() {
         row_with(text, "opensessions").is_some_and(|row| row.contains("▌"))
     });
 
+    // The user selects another session's row in both sidebars to look at it.
     lab.move_focus_off_active(&source, "opensessions");
     lab.move_focus_off_active(&second, "opensessions");
-    let stale_capture = lab.capture_pane(&source);
-    assert!(
-        has_non_active_focus_marker(&stale_capture, "opensessions"),
-        "test setup should leave a stale non-active focus row before switching away; got:\n{stale_capture}",
-    );
-    let second_stale_capture = lab.capture_pane(&second);
-    assert!(
-        has_non_active_focus_marker(&second_stale_capture, "opensessions"),
-        "test setup should leave every opensessions sidebar with stale temporary focus; got:\n{second_stale_capture}",
-    );
+    let selected_row = |pane: &str| {
+        lab.capture_pane(pane)
+            .lines()
+            .find(|line| line.contains('›'))
+            .map(str::to_string)
+            .unwrap_or_else(|| panic!("no selected row in {pane}:\n{}", lab.capture_pane(pane)))
+    };
+    let source_selected = selected_row(&source);
+    let second_selected = selected_row(&second);
+    assert!(!source_selected.contains("opensessions"));
 
+    // The client leaves through tmux itself and comes back: neither sidebar
+    // may move its selection, and the current session keeps its marker.
+    lab.tmux_ok(["switch-client", "-t", "effect-ts"]);
+    lab.wait_for_client_session("effect-ts");
+    lab.tmux_ok(["switch-client", "-t", "opensessions"]);
+    lab.wait_for_client_session("opensessions");
+    sleep(Duration::from_millis(700));
+    for (pane, expected) in [(&source, &source_selected), (&second, &second_selected)] {
+        let capture = lab.capture_pane(pane);
+        assert!(
+            row_with(&capture, "opensessions").is_some_and(|row| row.contains("▌")),
+            "current session must keep its marker; got:\n{capture}",
+        );
+        assert!(
+            capture.lines().any(|line| line == expected),
+            "the selected row must survive the client returning; wanted {expected:?}, got:\n{capture}",
+        );
+    }
+
+    // Leaving through the sidebar selects the destination; returning through
+    // another sidebar leaves that selection alone too.
     lab.tmux_ok(["send-keys", "-t", source.as_str(), "1"]);
     lab.wait_for_client_session("effect-ts");
     let effect = lab.sidebar_pane("effect-ts");
     lab.tmux_ok(["select-pane", "-t", effect.as_str()]);
     lab.click_session_row(&effect, "opensessions");
-
-    let first_visible = lab.first_capture_after_client_session("opensessions", &source);
+    lab.wait_for_client_session("opensessions");
+    sleep(Duration::from_millis(700));
+    let capture = lab.capture_pane(&source);
     assert!(
-        row_with(&first_visible, "opensessions").is_some_and(|row| row.contains("▌"))
-            && !has_non_active_focus_marker(&first_visible, "opensessions"),
-        "first visible opensessions sidebar frame after sidebar-driven switch must not show stale temporary focus; got:\n{first_visible}",
+        row_with(&capture, "effect-ts").is_some_and(|row| row.starts_with('›'))
+            && row_with(&capture, "opensessions").is_some_and(|row| row.contains("▌")),
+        "the destination picked in this sidebar stays selected after returning; got:\n{capture}",
     );
-
-    lab.wait_for_capture_pane(&source, |text| {
-        row_with(text, "opensessions").is_some_and(|row| row.contains("▌"))
-            && !has_non_active_focus_marker(text, "opensessions")
-    });
-    lab.wait_for_capture_pane(&second, |text| {
-        row_with(text, "opensessions").is_some_and(|row| row.contains("▌"))
-            && !has_non_active_focus_marker(text, "opensessions")
-    });
 }
 
 #[test]
@@ -1155,8 +1169,18 @@ impl ClaudeRecordHandle {
     }
 }
 
+/// A `tmux` command that cannot see the developer's own tmux: with `TMUX` /
+/// `TMUX_PANE` inherited, tmux resolves target-less commands (`display-message
+/// -p '#{pane_id}'`) against the caller's pane id whenever a pane with the
+/// same number exists on the lab server.
+fn tmux_command() -> Command {
+    let mut command = Command::new("tmux");
+    command.env_remove("TMUX").env_remove("TMUX_PANE");
+    command
+}
+
 fn started_lab(prefix: &str) -> Lab {
-    Command::new("tmux")
+    tmux_command()
         .arg("-V")
         .output()
         .expect("tmux is required for product E2E tests");
@@ -1382,7 +1406,7 @@ impl Lab {
     }
 
     fn setup_tmux(&mut self) {
-        let _ = Command::new("tmux")
+        let _ = tmux_command()
             .args(["-L", &self.socket, "kill-server"])
             .output();
         for (session, dir) in [
@@ -1442,6 +1466,8 @@ time.sleep(300)
             .arg(&self.socket)
             .arg(session)
             .env("TERM", "xterm-256color")
+            .env_remove("TMUX")
+            .env_remove("TMUX_PANE")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(
@@ -1456,6 +1482,7 @@ time.sleep(300)
         let tmux_env = self.tmux_socket_env();
         let child = Command::new(server)
             .env("TMUX", tmux_env)
+            .env_remove("TMUX_PANE")
             .env("HOME", self.home_dir())
             .env("OPENSESSIONS_WIDTH", "35")
             .env("OPENSESSIONS_HOST", "127.0.0.1")
@@ -1877,26 +1904,6 @@ time.sleep(300)
                 &target,
                 "-F",
                 "#{window_index} #{window_name} active=#{window_active}"
-            ]),
-            self.logs(),
-        );
-    }
-
-    fn first_capture_after_client_session(&self, expected: &str, pane: &str) -> String {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            let output = self.tmux(["list-clients", "-F", "#{client_session}"]);
-            if output.lines().any(|line| line.trim() == expected) {
-                return self.capture_pane(pane);
-            }
-            sleep(Duration::from_millis(10));
-        }
-        panic!(
-            "timed out waiting for client session {expected}; clients:\n{}\n\nlogs:\n{}",
-            self.tmux([
-                "list-clients",
-                "-F",
-                "#{client_name} #{client_tty} #{client_session}"
             ]),
             self.logs(),
         );
@@ -2429,7 +2436,7 @@ time.sleep(300)
     }
 
     fn tmux_ok<const N: usize>(&self, args: [&str; N]) {
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .arg("-L")
             .arg(&self.socket)
             .args(args)
@@ -2444,7 +2451,7 @@ time.sleep(300)
     }
 
     fn tmux<const N: usize>(&self, args: [&str; N]) -> String {
-        let output = Command::new("tmux")
+        let output = tmux_command()
             .arg("-L")
             .arg(&self.socket)
             .args(args)
@@ -2532,7 +2539,7 @@ impl Drop for Lab {
             let _ = client.kill();
             let _ = client.wait();
         }
-        let _ = Command::new("tmux")
+        let _ = tmux_command()
             .args(["-L", &self.socket, "kill-server"])
             .output();
         let _ = fs::remove_dir_all(&self.root);

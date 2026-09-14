@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
+use opensessions_runtime::debug_log::log_with_tag;
 use opensessions_runtime::sidebar_width_sync::{MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH};
 
 use crate::generated::protocol::{
@@ -252,6 +253,25 @@ impl App {
     }
 
     pub fn apply_server_message(&mut self, message: ServerMessage) {
+        let focus_before = self.sidebar_focus.clone();
+        let kind = match &message {
+            ServerMessage::State(state) => format!("state sessions={}", state.sessions.len()),
+            other => format!("{other:?}"),
+        };
+        self.apply_server_message_inner(message);
+        if self.sidebar_focus != focus_before {
+            log_with_tag(
+                "sidebar-core",
+                format!(
+                    "focus moved by server message {kind}: {focus_before:?} -> {:?} (local={:?})",
+                    self.sidebar_focus,
+                    self.confirmed_local_session_name(),
+                ),
+            );
+        }
+    }
+
+    fn apply_server_message_inner(&mut self, message: ServerMessage) {
         match message {
             ServerMessage::State(state) => {
                 let previous_focus = self.sidebar_focus.clone();
@@ -306,11 +326,14 @@ impl App {
                             .map(|source| source == &identity.pane_id)
                     })
                     .unwrap_or(false);
+                // The client came (back) to this sidebar's session. The row
+                // the user selected here stays selected: a selection is only
+                // changed by the user or when its row disappears.
                 if !from_this_pane
                     && self.confirmed_local_session_name() == Some(name.as_str())
                     && previous_activated.as_deref() != Some(name.as_str())
                 {
-                    self.confirm_local_session(name, true);
+                    self.confirm_local_session(name, false);
                 }
             }
             ServerMessage::ReIdentify => {
@@ -1152,8 +1175,9 @@ impl App {
         if self.confirmed_local_session_name() == Some(broadcast_session) {
             return;
         }
+        // The switch landed elsewhere; the row it targeted stays selected
+        // here so this sidebar keeps showing what the user last chose.
         self.pending_switch_session = None;
-        self.rehome_focus_to_local_session();
     }
 
     fn clear_missing_pending_switch(&mut self) {
@@ -1437,6 +1461,38 @@ mod tests {
             liveness: None,
             detail: None,
         }
+    }
+
+    #[test]
+    fn returning_to_the_session_keeps_the_row_the_user_selected() {
+        let mut state = empty_state(10);
+        state.sessions = vec![
+            session("work", "/tmp/work", false),
+            session("docs", "/tmp/docs", false),
+        ];
+        state.current_session = Some("work".to_string());
+        let mut app = App::from_state(state.clone());
+        app.apply_server_message(ServerMessage::YourSession {
+            name: "work".to_string(),
+            client_tty: None,
+        });
+        assert_eq!(app.focused_session_name(), Some("work"));
+
+        app.set_sidebar_focus(SidebarFocus::Session("docs".to_string()));
+
+        // The client leaves for another session and comes back.
+        app.apply_server_message(ServerMessage::ActivateSession {
+            name: "other".to_string(),
+            source_pane_id: None,
+        });
+        app.apply_server_message(ServerMessage::ActivateSession {
+            name: "work".to_string(),
+            source_pane_id: None,
+        });
+        app.apply_server_message(ServerMessage::State(state));
+
+        assert_eq!(app.focused_session_name(), Some("docs"));
+        assert_eq!(app.my_session.as_deref(), Some("work"));
     }
 
     #[test]

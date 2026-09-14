@@ -29,6 +29,7 @@ Clicking a detected port opens `http://localhost:<port>`.
 
 - Multiple agent instances per session when a watcher emits `threadId`
 - Per-instance unseen tracking: a finished agent keeps its `●` until its pane is the active pane of an attached tmux client, until you `Enter` it, or until the session is marked seen
+- The selected row is yours: it only moves when you move it or when its row disappears — coming back to a session does not reset its sidebar's selection (the current session is marked with `▌`, the selected row with `›`)
 - Status values: `idle`, `running`, `tool-running`, `done`, `error`, `waiting`, `interrupted`, `stale`; a qualifier in parentheses adds the reason when there is one (`working (delegating)` while background subagents run, `blocked (dialog open)`, `done (shell running)`)
 - Live Claude Code sessions are rows even while idle (`✓ idle`), named after their `/rename` name
 - Agents are removed automatically about 10 seconds after their tmux pane or process disappears, whatever their status. Agents that never had a pane are dropped after 5 minutes once seen or 30 minutes while still unseen when finished, and after 30 minutes of silence otherwise. `d` in the agents panel removes one immediately.
@@ -125,7 +126,7 @@ Mouse: click a session row to switch, click a group header to collapse/expand, c
 
 - Git info is cached for 5 seconds.
 - Listening localhost ports are re-polled every 10 seconds (via `lsof`).
-- The Claude Code session registry is polled every 500 ms. Transcript watchers (Amp, Claude Code, Codex, OpenCode, Pi, Droid) poll every 2 seconds, only look at files modified in the last 5 minutes (plus the transcripts of live Claude Code sessions), and read Claude Code and Codex transcripts incrementally.
+- The Claude Code session registry is polled every 500 ms (tmux is only asked when a record or process changed). Transcript watchers (Amp, Codex, OpenCode, Pi, Droid) poll every 2 seconds and only look at files modified in the last 5 minutes; the transcripts of live Claude Code sessions are read incrementally on the same cadence, for their title and last prompt only.
 - tmux state is re-polled every 2 seconds as a backstop for anything the hooks missed.
 
 ## Files And Paths The UI Depends On
