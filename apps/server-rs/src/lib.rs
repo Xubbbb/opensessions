@@ -19,7 +19,7 @@ use opensessions_runtime::agent_watchers::{
 };
 use opensessions_runtime::claude_registry::{
     ClaudeRegistryRecord, ProcessInspector, RecordLiveness, RegistryResolver, ResolvedRecord,
-    SystemProcessInspector, claude_code_config_dirs, scan_registry,
+    SystemProcessInspector, claude_code_config_dirs_with, scan_registry,
 };
 use opensessions_runtime::config::{
     OpensessionsConfig, SidebarPosition as ConfigSidebarPosition, load_config_from_home,
@@ -388,6 +388,9 @@ pub struct ReadOnlyMuxStateSource {
     /// live record (an exited or `/clear`ed session, a `claude -p` run) is
     /// never a row.
     claude_registry_threads: Mutex<Vec<RegistryThread>>,
+    /// `claudeConfigDirs` from config.json: registries of Claude accounts
+    /// kept outside `~/.claude*`.
+    claude_config_dirs: Vec<String>,
     pi_runtime_registry: Mutex<PiRuntimeRegistry>,
     now_ms: Arc<dyn Fn() -> u64 + Send + Sync>,
 }
@@ -435,6 +438,12 @@ pub fn default_state_source_from_env(
         if let Some(filter) = config.as_ref().and_then(|config| config.session_filter) {
             source = source.with_session_filter(filter);
         }
+        if let Some(dirs) = config
+            .as_ref()
+            .and_then(|config| config.claude_config_dirs.clone())
+        {
+            source = source.with_claude_config_dirs(dirs);
+        }
         if let Some(home) = home {
             source = source.with_session_order_path(session_order_path(&home));
         }
@@ -465,6 +474,7 @@ impl ReadOnlyMuxStateSource {
             agent_tracker: Mutex::new(AgentTracker::new()),
             registry_resolver: Mutex::new(RegistryResolver::new()),
             claude_registry_threads: Mutex::new(Vec::new()),
+            claude_config_dirs: Vec::new(),
             pi_runtime_registry: Mutex::new(PiRuntimeRegistry::with_default_ttl()),
             now_ms: Arc::new(current_time_ms),
         }
@@ -496,6 +506,11 @@ impl ReadOnlyMuxStateSource {
     }
 
     /// Persist custom ordering and hidden sessions to `path` across restarts.
+    pub fn with_claude_config_dirs(mut self, dirs: Vec<String>) -> Self {
+        self.claude_config_dirs = dirs;
+        self
+    }
+
     pub fn with_session_order_path(self, path: PathBuf) -> Self {
         *self.session_order.lock().unwrap() = SessionOrder::new(Some(path));
         self
@@ -2035,7 +2050,13 @@ async fn run_agent_watcher_loop(
                 // a process changed, or on the slower transcript cadence.
                 let records = home
                     .as_deref()
-                    .map(|home| scan_registry(&claude_code_config_dirs(home)))
+                    .map(|home| {
+                        scan_registry(&claude_code_config_dirs_with(
+                            home,
+                            std::env::var_os("CLAUDE_CONFIG_DIR").as_deref(),
+                            &source.claude_config_dirs,
+                        ))
+                    })
                     .unwrap_or_default();
                 let fingerprint = RegistryFingerprint::of(&records);
                 let registry_changed = last_registry.as_ref() != Some(&fingerprint);

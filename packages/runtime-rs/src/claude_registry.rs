@@ -167,6 +167,17 @@ pub fn claude_code_config_dirs(home: &Path) -> Vec<PathBuf> {
 }
 
 pub fn claude_code_config_dirs_from(home: &Path, config_dir: Option<&OsStr>) -> Vec<PathBuf> {
+    claude_code_config_dirs_with(home, config_dir, &[])
+}
+
+/// `claude_code_config_dirs_from` plus directories the user configured
+/// explicitly (`claudeConfigDirs` in `config.json`), for accounts that live
+/// outside `~/.claude*`.
+pub fn claude_code_config_dirs_with(
+    home: &Path,
+    config_dir: Option<&OsStr>,
+    configured: &[String],
+) -> Vec<PathBuf> {
     let mut dirs = vec![home.join(".claude")];
     let mut push_unique = |dir: PathBuf| {
         if !dirs.contains(&dir) {
@@ -176,6 +187,11 @@ pub fn claude_code_config_dirs_from(home: &Path, config_dir: Option<&OsStr>) -> 
 
     if let Some(config_dir) = config_dir.filter(|value| !value.is_empty()) {
         push_unique(expand_home(home, Path::new(config_dir)));
+    }
+    for dir in configured {
+        if !dir.is_empty() {
+            push_unique(expand_home(home, Path::new(dir)));
+        }
     }
 
     let mut siblings = fs::read_dir(home)
@@ -632,6 +648,38 @@ mod tests {
         assert_eq!(
             claude_code_config_dirs_from(&home, Some(home.join(".claude-personal").as_os_str())),
             vec![home.join(".claude"), home.join(".claude-personal")]
+        );
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn configured_config_dirs_are_added_after_discovery_with_home_expanded() {
+        let home = std::env::temp_dir().join(format!(
+            "opensessions-registry-configured-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(home.join(".claude-personal/sessions")).unwrap();
+
+        let dirs = claude_code_config_dirs_with(
+            &home,
+            None,
+            &[
+                "~/accounts/work-claude".to_string(),
+                "/srv/claude-b".to_string(),
+                "~/.claude-personal".to_string(),
+                String::new(),
+            ],
+        );
+
+        assert_eq!(
+            dirs,
+            vec![
+                home.join(".claude"),
+                home.join("accounts/work-claude"),
+                PathBuf::from("/srv/claude-b"),
+                home.join(".claude-personal"),
+            ]
         );
         let _ = fs::remove_dir_all(&home);
     }

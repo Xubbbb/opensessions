@@ -35,6 +35,11 @@ pub struct OpensessionsConfig {
     pub detail_panel_height: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_filter: Option<SessionFilterMode>,
+    /// Extra Claude Code config directories (`CLAUDE_CONFIG_DIR` values) to
+    /// watch besides `~/.claude`, the server's own `CLAUDE_CONFIG_DIR`, and
+    /// the `~/.claude*` siblings found automatically. `~` expands to home.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_config_dirs: Option<Vec<String>>,
 }
 
 pub fn config_path_from_home(home: &Path) -> PathBuf {
@@ -99,6 +104,7 @@ fn update_map(updates: OpensessionsConfig) -> Map<String, Value> {
     insert_option(&mut map, "keybinding", updates.keybinding);
     insert_option(&mut map, "detailPanelHeight", updates.detail_panel_height);
     insert_option(&mut map, "sessionFilter", updates.session_filter);
+    insert_option(&mut map, "claudeConfigDirs", updates.claude_config_dirs);
 
     map
 }
@@ -125,5 +131,48 @@ fn merge_value(dst: &mut Value, src: Value) {
             }
         }
         (dst, src) => *dst = src,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claude_config_dirs_round_trip_and_survive_other_updates() {
+        let home = std::env::temp_dir().join(format!(
+            "opensessions-config-claude-dirs-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&home);
+        fs::create_dir_all(config_path_from_home(&home).parent().unwrap()).unwrap();
+        fs::write(
+            config_path_from_home(&home),
+            r#"{"sidebarWidth": 30, "claudeConfigDirs": ["~/.claude-work", "/srv/claude-b"]}"#,
+        )
+        .unwrap();
+
+        let loaded = load_config_from_home(&home);
+        assert_eq!(
+            loaded.claude_config_dirs,
+            Some(vec![
+                "~/.claude-work".to_string(),
+                "/srv/claude-b".to_string()
+            ])
+        );
+
+        // A runtime update of another field keeps the list.
+        save_config_to_home(
+            &home,
+            OpensessionsConfig {
+                sidebar_width: Some(40),
+                ..OpensessionsConfig::default()
+            },
+        )
+        .unwrap();
+        let reloaded = load_config_from_home(&home);
+        assert_eq!(reloaded.sidebar_width, Some(40));
+        assert_eq!(reloaded.claude_config_dirs, loaded.claude_config_dirs);
+        let _ = fs::remove_dir_all(&home);
     }
 }

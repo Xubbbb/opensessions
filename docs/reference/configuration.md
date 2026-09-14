@@ -34,6 +34,7 @@ If the file does not exist, opensessions falls back to defaults.
 | `sidebarPosition` | `"left" | "right"` | `"left"` | active | Sidebar placement |
 | `port` | `number` | none | parsed only | Present in the config type; use `OPENSESSIONS_PORT`/tmux-scoped environment for runtime port overrides today |
 | `keybinding` | `string` | none | parsed only | Present in the config type, but keybindings are configured outside this file today |
+| `claudeConfigDirs` | `string[]` | `[]` | active | Extra Claude Code config directories (the values you pass as `CLAUDE_CONFIG_DIR`) whose session registries and transcripts the sidebar watches, on top of `~/.claude`, the server's own `CLAUDE_CONFIG_DIR`, and every `~/.claude*` sibling found automatically; `~` expands to your home |
 
 ## Built-In Themes
 
