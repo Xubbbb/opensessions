@@ -586,9 +586,9 @@ fn tmux_sidebar_routes_enter_to_the_right_claude_pane_and_follows_session_id_cha
     // Two `claude` panes in one session: the old alias heuristic could not
     // tell them apart; the registry binding can.
     lab.focus_agent_thread("opensessions", "claude-code", "sess-b");
-    assert_eq!(lab.active_pane(), second_pane);
+    lab.wait_for_active_pane(&second_pane);
     lab.focus_agent_thread("opensessions", "claude-code", "sess-a");
-    assert_eq!(lab.active_pane(), first_pane);
+    lab.wait_for_active_pane(&first_pane);
     lab.tmux_ok(["select-pane", "-t", sidebar.as_str()]);
 
     // `/clear` in the first pane: same process, new session id.
@@ -1714,6 +1714,23 @@ time.sleep(300)
             ws.close().await.expect("close focus-agent ws client");
             tokio::time::sleep(Duration::from_millis(100)).await;
         });
+    }
+
+    /// The server resolves and focuses an agent pane asynchronously (a few
+    /// tmux round trips); wait for tmux to report it as the active pane.
+    fn wait_for_active_pane(&self, expected: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if self.active_pane() == expected {
+                return;
+            }
+            sleep(Duration::from_millis(50));
+        }
+        panic!(
+            "timed out waiting for pane {expected} to become active; active={}\n\nlogs:\n{}",
+            self.active_pane(),
+            self.logs(),
+        );
     }
 
     fn pane_pid(&self, pane: &str) -> u32 {

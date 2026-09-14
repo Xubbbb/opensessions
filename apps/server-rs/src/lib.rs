@@ -19,8 +19,8 @@ use opensessions_runtime::agent_watchers::{
     parse_codex_session_index, pi_snapshot_from_jsonl,
 };
 use opensessions_runtime::claude_registry::{
-    CLAUDE_CODE_AGENT, RecordLiveness, RegistryResolver, ResolvedRecord, SystemProcessInspector,
-    claude_code_config_dirs, scan_registry,
+    CLAUDE_CODE_AGENT, ClaudeRegistryRecord, ProcessInspector, RecordLiveness, RegistryResolver,
+    ResolvedRecord, SystemProcessInspector, claude_code_config_dirs, scan_registry,
 };
 use opensessions_runtime::config::{
     OpensessionsConfig, SidebarPosition as ConfigSidebarPosition, load_config_from_home,
@@ -628,11 +628,7 @@ impl ReadOnlyMuxStateSource {
 
     /// Fold this tick's Claude Code registry records into the tracker.
     /// Returns whether any row changed.
-    fn apply_claude_registry(&self, panes: &[MuxPane], home: Option<&Path>) -> bool {
-        let Some(home) = home else {
-            return false;
-        };
-        let records = scan_registry(&claude_code_config_dirs(home));
+    fn apply_claude_registry(&self, records: Vec<ClaudeRegistryRecord>, panes: &[MuxPane]) -> bool {
         let resolved =
             self.registry_resolver
                 .lock()
@@ -2072,6 +2068,7 @@ async fn run_agent_watcher_loop(
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let mut tick = 0_u32;
     let mut tails = Some(TranscriptTails::default());
+    let mut last_registry: Option<RegistryFingerprint> = None;
 
     loop {
         tokio::select! {
@@ -2080,13 +2077,25 @@ async fn run_agent_watcher_loop(
                 tick = tick.wrapping_add(1);
                 let mut changed = false;
 
-                // Registry: cheap, every tick. The pane listing it needs is
-                // reused for the sync so this costs two tmux calls per tick.
+                // Registry: reading the records is microseconds, so it runs
+                // every tick; tmux is only asked (two calls) when a record or
+                // a process changed, or on the slower transcript cadence.
+                let records = home
+                    .as_deref()
+                    .map(|home| scan_registry(&claude_code_config_dirs(home)))
+                    .unwrap_or_default();
+                let fingerprint = RegistryFingerprint::of(&records);
+                let registry_changed = last_registry.as_ref() != Some(&fingerprint);
+                let transcript_tick = tick.is_multiple_of(AGENT_TRANSCRIPT_TICK_EVERY);
+                if !registry_changed && !transcript_tick {
+                    continue;
+                }
+                last_registry = Some(fingerprint);
                 let (panes, focus) = source.observe_mux();
-                changed = source.apply_claude_registry(&panes, home.as_deref()) || changed;
+                changed = source.apply_claude_registry(records, &panes) || changed;
                 changed = source.sync_agents_with(&panes, &focus) || changed;
 
-                if tick.is_multiple_of(AGENT_TRANSCRIPT_TICK_EVERY) {
+                if transcript_tick {
                     let now = current_time_ms();
                     // Transcripts of live registry sessions are enrichment,
                     // not snapshots; the recent-file scan skips them.
@@ -2149,6 +2158,27 @@ async fn run_agent_watcher_loop(
                 }
             }
         }
+    }
+}
+
+/// What the registry looked like on the last tick: the records themselves
+/// plus whether each process still exists, so a killed process is noticed
+/// even though its record file is unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegistryFingerprint {
+    records: Vec<ClaudeRegistryRecord>,
+    alive: Vec<bool>,
+}
+
+impl RegistryFingerprint {
+    fn of(records: &[ClaudeRegistryRecord]) -> Self {
+        let mut records = records.to_vec();
+        records.sort_by_key(|record| record.pid);
+        let alive = records
+            .iter()
+            .map(|record| SystemProcessInspector.facts(record.pid).is_some())
+            .collect();
+        Self { records, alive }
     }
 }
 
