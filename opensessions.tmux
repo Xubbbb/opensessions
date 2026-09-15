@@ -72,9 +72,19 @@ bind_global_index_keys() {
 tmux set-environment -g OPENSESSIONS_DIR "$CURRENT_DIR"
 tmux set-environment -gu OPENSESSIONS_WIDTH 2>/dev/null || true
 
-# --- Bootstrap: kill stale server if version or install path changed ---
+# --- Bootstrap: kill stale server if the binaries or install path changed ---
+# The stamp describes the server binary that will actually run (its bundle
+# version and mtime), not the version package.json asks for: a failed download
+# must not stamp a version that is not installed (the running server would
+# then never be restarted once the download succeeds), and a rebuilt local
+# binary must restart the server even when the version did not change.
 VERSION_FILE="${PID_FILE%.pid}.version"
-CURRENT_VERSION="${CURRENT_DIR}:${PACKAGE_VERSION}"
+INSTALLED_VERSION="$(cat "$CURRENT_DIR/bin/.opensessions-version" 2>/dev/null || true)"
+server_bin_stamp() {
+  [ -n "$RUST_SERVER_BIN" ] || { echo none; return; }
+  stat -c %Y "$RUST_SERVER_BIN" 2>/dev/null || stat -f %m "$RUST_SERVER_BIN" 2>/dev/null || echo unknown
+}
+CURRENT_VERSION="${CURRENT_DIR}:${INSTALLED_VERSION:-$PACKAGE_VERSION}:$(server_bin_stamp)"
 RUNNING_VERSION=""
 [ -f "$VERSION_FILE" ] && RUNNING_VERSION=$(cat "$VERSION_FILE" 2>/dev/null)
 
