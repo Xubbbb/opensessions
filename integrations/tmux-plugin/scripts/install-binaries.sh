@@ -35,9 +35,12 @@ download() {
   url="$1"
   dest="$2"
   # Bounded: this runs synchronously while tmux loads its config, so a
-  # stalled connection must not hang the tmux startup.
+  # stalled connection must not hang the tmux startup. Retries are for
+  # quick transient failures (a 5xx, a reset): --max-time resets per
+  # attempt, so --retry-max-time keeps a stalled download from being
+  # retried for another three minutes.
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --connect-timeout 10 -m 180 --retry 2 --retry-delay 1 "$url" -o "$dest"
+    curl -fsSL --connect-timeout 10 -m 180 --retry 2 --retry-delay 1 --retry-max-time 30 "$url" -o "$dest"
   elif command -v wget >/dev/null 2>&1; then
     wget -q --timeout=10 --tries=2 -O "$dest" "$url"
   else

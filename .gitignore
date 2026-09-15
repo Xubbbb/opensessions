@@ -7,3 +7,6 @@ target
 .agents/skills/grill-me/
 # Prebuilt release binaries downloaded by opensessions.tmux on first load
 bin/
+# Server pid files written next to a local checkout by ad-hoc runs
+*.pid
+*.pid.*

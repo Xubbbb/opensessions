@@ -271,8 +271,10 @@ impl App {
                 .as_ref()
                 .is_none_or(|focus| !self.focus_exists(focus))
             {
-                self.sidebar_focus = self.display_session_entries().first().map(entry_focus);
-                self.session_scroll_follows_focus = true;
+                match self.display_session_entries().first().map(entry_focus) {
+                    Some(first) => self.set_sidebar_focus(first),
+                    None => self.sidebar_focus = None,
+                }
             }
         }
     }
