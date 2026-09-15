@@ -478,6 +478,41 @@ fn tmux_sidebar_keeps_session_and_agent_panel_seen_state_in_sync_per_focused_pan
 }
 
 #[test]
+fn tmux_sidebar_learns_its_new_session_name_after_a_rename() {
+    let _guard = e2e_serial_guard();
+    let lab = started_lab("opensessions-e2e-rename-identity");
+    let source = lab.sidebar_pane("opensessions");
+    lab.tmux_ok(["switch-client", "-t", "opensessions"]);
+    lab.tmux_ok(["select-pane", "-t", source.as_str()]);
+    lab.wait_for_capture_pane(&source, |text| {
+        row_with(text, "opensessions").is_some_and(|row| row.contains("▌"))
+    });
+    // A selection elsewhere, so a stale one would be visible later.
+    lab.move_focus_off_active(&source, "opensessions");
+
+    lab.tmux_ok(["rename-session", "-t", "opensessions", "renamed"]);
+
+    // The sidebar re-identifies: its own row is the renamed one, and the
+    // selection it had is untouched.
+    lab.wait_for_capture_pane(&source, |text| {
+        row_with(text, "renamed").is_some_and(|row| row.contains("▌"))
+            && has_non_active_focus_marker(text, "renamed")
+    });
+
+    // Choosing the renamed session from another sidebar selects it here.
+    lab.tmux_ok(["switch-client", "-t", "effect-ts"]);
+    lab.wait_for_client_session("effect-ts");
+    let effect = lab.sidebar_pane("effect-ts");
+    lab.tmux_ok(["select-pane", "-t", effect.as_str()]);
+    lab.click_session_row(&effect, "renamed");
+    lab.wait_for_client_session("renamed");
+    lab.wait_for_capture_pane(&source, |text| {
+        row_with(text, "renamed").is_some_and(|row| row.contains("▌"))
+            && !has_non_active_focus_marker(text, "renamed")
+    });
+}
+
+#[test]
 fn tmux_sidebar_shows_claude_registry_sessions_by_name_with_live_status() {
     let _guard = e2e_serial_guard();
     let lab = started_lab("opensessions-e2e-claude-registry-status");

@@ -251,6 +251,10 @@ pub fn apply_ui_mouse(app: &mut App, event: UiMouse) {
             width,
             height,
         } => {
+            // A modal owns the input; a click must not reach the rows behind it.
+            if app.is_modal_open() {
+                return;
+            }
             // Check if clicking on the separator row to start a drag resize
             if y == detail_separator_row(app, width, height) {
                 app.resize_drag_state = Some((y, app.detail_panel_height));

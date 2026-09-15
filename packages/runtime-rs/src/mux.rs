@@ -198,6 +198,13 @@ pub trait MuxProvider: Send + Sync {
         None
     }
 
+    /// The current name of the session a pane belongs to. Sessions can be
+    /// renamed after a sidebar was spawned into them, so identity must be
+    /// asked of the mux rather than remembered.
+    fn pane_session_name(&self, _pane_id: &str) -> Option<String> {
+        None
+    }
+
     /// Work around lost pane-exit notifications in the mux, if it has any
     /// dead panes waiting to be reaped. Returns whether a nudge was sent.
     fn nudge_dead_panes(&self) -> bool {

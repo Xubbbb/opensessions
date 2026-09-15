@@ -35,7 +35,7 @@ owned_hook_indices() {
       if (close_bracket == 0) next
       idx = substr(rest, 1, close_bracket - 1)
       cmd = substr(rest, close_bracket + 1)
-      if (idx == slot || cmd ~ /opensessions-sidebar/ || cmd ~ /--connect-timeout 0\.1 -X POST http:\/\/[^ ]*\/(focus|refresh|ensure-sidebar|pane-exited|client-resized|pane-layout-changed)([ ?"]|$)/) {
+      if (idx == slot || cmd ~ /opensessions-sidebar/ || cmd ~ /--connect-timeout 0\.1 -X POST http:\/\/[^ ]*\/(focus|refresh|session-renamed|ensure-sidebar|pane-exited|client-resized|pane-layout-changed)([ ?"]|$)/) {
         print idx
       }
     }'
@@ -45,6 +45,7 @@ for hook in \
   after-select-pane \
   session-created \
   session-closed \
+  session-renamed \
   after-select-window \
   after-new-window \
   client-resized \

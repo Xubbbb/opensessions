@@ -747,6 +747,16 @@ impl ReadOnlyMuxStateSource {
             ));
             return false;
         }
+        // `select-pane` issued by a script has no client behind it: nobody is
+        // looking at that pane, so it must not count as seen. The periodic
+        // sync still marks it seen once an attached client shows it.
+        if context.client_tty.is_none() {
+            debug_log(format!(
+                "focus-pane ignored without client session={} pane={:?}",
+                context.session, context.pane_id,
+            ));
+            return false;
+        }
         let Some(pane_id) = context
             .pane_id
             .as_deref()
@@ -1111,15 +1121,27 @@ impl StateSource for ReadOnlyMuxStateSource {
         if command.get("type").and_then(Value::as_str)? != "identify-pane" {
             return None;
         }
-        let session_name = command.get("sessionName")?.as_str()?;
-        if session_name == "_os_stash" {
-            return None;
-        }
+        let reported_name = command.get("sessionName")?.as_str()?;
         context.pane_id = command
             .get("paneId")
             .and_then(Value::as_str)
             .map(ToString::to_string);
-        context.session_name = Some(session_name.to_string());
+        // The sidebar reports the name its pane had when it was spawned; the
+        // session may have been renamed since, so ask the mux which session
+        // the pane is in now.
+        let session_name = context
+            .pane_id
+            .as_deref()
+            .and_then(|pane_id| {
+                self.providers
+                    .iter()
+                    .find_map(|provider| provider.pane_session_name(pane_id))
+            })
+            .unwrap_or_else(|| reported_name.to_string());
+        if session_name == "_os_stash" {
+            return None;
+        }
+        context.session_name = Some(session_name.clone());
         context.window_id = command
             .get("windowId")
             .and_then(Value::as_str)
@@ -1146,7 +1168,7 @@ impl StateSource for ReadOnlyMuxStateSource {
         let client_tty = self.providers.first()?.get_client_tty();
         Some(format!(
             r#"{{"type":"your-session","name":{},"clientTty":{}}}"#,
-            json_string_or_null(Some(session_name)),
+            json_string_or_null(Some(&session_name)),
             json_string_or_null(Some(&client_tty)),
         ))
     }
@@ -1308,6 +1330,15 @@ impl StateSource for ReadOnlyMuxStateSource {
                     self.enforce_sidebar_width(self.current_sidebar_width_u16());
                 }
                 None
+            }
+            "/session-renamed" => {
+                // Every sidebar re-identifies its pane so the ones living in
+                // the renamed session learn their new name; the list itself
+                // refreshes with the next snapshot.
+                Some(
+                    serde_json::to_string(&SidebarServerMessage::ReIdentify)
+                        .expect("re-identify must serialize"),
+                )
             }
             _ => None,
         }
@@ -2826,7 +2857,9 @@ pub async fn start_server(config: ServerConfig) -> Result<ServerHandle, ServerEr
     fs::write(&config.pid_file, process::id().to_string())?;
 
     let (shutdown, shutdown_rx) = broadcast::channel(1);
-    let (state_updates, _) = broadcast::channel(16);
+    // Roomy enough that a sidebar briefly behind on rendering does not lose
+    // a one-off message (ActivateSession, ReIdentify) between two states.
+    let (state_updates, _) = broadcast::channel(256);
     let shutdown_announcement = Arc::new(ShutdownAnnouncement::default());
     if let Some(source) = config.state_source.clone() {
         let _background_tasks = source
@@ -3426,6 +3459,7 @@ fn is_ok_hook_path(path: &str) -> bool {
             | "/pane-layout-changed"
             | "/client-resized"
             | "/ensure-sidebar"
+            | "/session-renamed"
             | "/toggle"
     )
 }

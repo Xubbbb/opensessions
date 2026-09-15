@@ -560,6 +560,7 @@ impl MuxProvider for TmuxProvider {
         let hook_context = hook_context_format();
         let focus_cmd = http_hook_command(&base, "/focus", Some(hook_context), true);
         let refresh_cmd = http_hook_command(&base, "/refresh", None, true);
+        let renamed_cmd = http_hook_command(&base, "/session-renamed", None, true);
         let ensure_cmd = http_hook_command(&base, "/ensure-sidebar", Some(hook_context), true);
         let pane_exited_cmd = pane_exited_hook_command(&base);
         let pane_died_cmd = pane_died_hook_command(&base);
@@ -580,6 +581,7 @@ impl MuxProvider for TmuxProvider {
         self.client.set_global_hook("after-select-pane", &focus_cmd);
         self.client.set_global_hook("session-created", &refresh_cmd);
         self.client.set_global_hook("session-closed", &refresh_cmd);
+        self.client.set_global_hook("session-renamed", &renamed_cmd);
         self.client
             .set_global_hook("after-select-window", &ensure_cmd);
         self.client.set_global_hook("after-new-window", &ensure_cmd);
@@ -603,6 +605,7 @@ impl MuxProvider for TmuxProvider {
             "after-select-pane",
             "session-created",
             "session-closed",
+            "session-renamed",
             "after-select-window",
             "after-new-window",
             "client-resized",
@@ -929,6 +932,11 @@ impl MuxProvider for TmuxProvider {
             .into_iter()
             .find(|session| session.id == id)
             .map(|session| session.name)
+    }
+
+    fn pane_session_name(&self, pane_id: &str) -> Option<String> {
+        let name = self.client.display("#{session_name}", Some(pane_id));
+        (!name.is_empty()).then_some(name)
     }
 
     fn nudge_dead_panes(&self) -> bool {
