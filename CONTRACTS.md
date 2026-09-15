@@ -174,8 +174,9 @@ Provider methods are synchronous because tmux operations are command-driven and 
 
 ## Built-In Runtime Behaviors To Know About
 
-- The server computes `ServerState` from tmux sessions, git/cache state, metadata, ports, and tracked agent events.
-- Session ordering is persisted separately from tmux ordering.
+- The server computes `ServerState` from tmux sessions, git/cache state, metadata, ports, and tracked agent events. Each `SessionData` carries the tmux session id (`id`, e.g. `$3`) next to its name; the sidebar keys its own row and its selection by that id, so a rename is followed in place. A sidebar learns its own session from `YourSession { name, client_tty, session_id }` at identification and again on the `session-renamed` hook (`ReIdentify`).
+- Session ordering is persisted separately from tmux ordering, keyed by name but reconciled by session id: a renamed session keeps its place and its hidden state.
+- `ActivateSession { name, source_pane_id, chosen }` tells sidebars a session became the client's session. `chosen: true` means the user picked it (a sidebar's Enter/click/`Tab`/digits, `/switch-index`, the neighbour after killing the current session) and the destination's sidebars select it; `chosen: false` (tmux hooks) moves no selection. Switching from a sidebar hands the source window's focus back to its content pane before `switch-client`.
 - Toggling the sidebar off kills its panes; only `prefix o → e` uses the `_os_stash` session, briefly, while re-laying out a window.
 - tmux is the only supported built-in mux today.
 - The sidebar and helper scripts resolve the server port from the tmux socket via `OPENSESSIONS_SERVER_KEY`, defaulting to derived per-socket ports.

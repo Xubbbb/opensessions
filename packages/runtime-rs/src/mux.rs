@@ -3,6 +3,8 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MuxSessionInfo {
+    /// Mux-native stable id (tmux `$N`); empty when the mux has none.
+    pub id: String,
     pub name: String,
     pub created_at: u64,
     pub dir: String,
@@ -198,10 +200,10 @@ pub trait MuxProvider: Send + Sync {
         None
     }
 
-    /// The current name of the session a pane belongs to. Sessions can be
-    /// renamed after a sidebar was spawned into them, so identity must be
-    /// asked of the mux rather than remembered.
-    fn pane_session_name(&self, _pane_id: &str) -> Option<String> {
+    /// The `(id, name)` of the session a pane belongs to right now. Sessions
+    /// can be renamed after a sidebar was spawned into them, so identity must
+    /// be asked of the mux rather than remembered.
+    fn pane_session(&self, _pane_id: &str) -> Option<(String, String)> {
         None
     }
 

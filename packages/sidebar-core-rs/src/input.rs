@@ -212,6 +212,13 @@ fn apply_width_slider_key(app: &mut App, key: UiKey) {
 }
 
 pub fn apply_ui_mouse(app: &mut App, event: UiMouse) {
+    // A modal owns the input; nothing may reach the rows behind it.
+    if app.is_modal_open() {
+        if matches!(event, UiMouse::DragEnd) {
+            app.resize_drag_state = None;
+        }
+        return;
+    }
     match event {
         UiMouse::ScrollUp {
             x: _,
@@ -251,8 +258,7 @@ pub fn apply_ui_mouse(app: &mut App, event: UiMouse) {
             width,
             height,
         } => {
-            // A modal owns the input; a click must not reach the rows behind it.
-            if app.is_modal_open() {
+            if app.ignores_clicks_at(std::time::Instant::now()) {
                 return;
             }
             // Check if clicking on the separator row to start a drag resize
@@ -284,5 +290,145 @@ pub fn apply_ui_mouse(app: &mut App, event: UiMouse) {
         UiMouse::DragEnd => {
             app.resize_drag_state = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use crate::app::{Modal, SidebarFocus};
+    use crate::generated::protocol::{
+        AgentPanelScope, ClientCommand, ServerMessage, ServerState, SessionData,
+    };
+
+    fn session(name: &str) -> SessionData {
+        SessionData {
+            name: name.to_string(),
+            id: None,
+            created_at: 0,
+            dir: format!("/tmp/{name}"),
+            branch: String::new(),
+            dirty: false,
+            changed_files: 0,
+            insertions: 0,
+            deletions: 0,
+            is_worktree: false,
+            unseen: false,
+            panes: 1,
+            ports: Vec::new(),
+            local_links: Vec::new(),
+            windows: 1,
+            uptime: String::new(),
+            agent_state: None,
+            agents: Vec::new(),
+            event_timestamps: Vec::new(),
+            metadata: None,
+        }
+    }
+
+    fn app() -> App {
+        let mut app = App::from_state(ServerState {
+            sessions: vec![session("work"), session("docs"), session("notes")],
+            focused_session: None,
+            current_session: Some("work".to_string()),
+            theme: None,
+            session_filter: None,
+            agent_panel_scope: AgentPanelScope::Current,
+            sidebar_width: 40,
+            detail_panel_height: 10,
+            initializing: false,
+            init_label: None,
+            collapsed_worktree_groups: Vec::new(),
+            ts: 0,
+        });
+        app.set_pane_identity("%1".to_string(), "work".to_string(), Some("@1".to_string()));
+        app
+    }
+
+    /// Screen row of a session's name line (header, blank, then 3 rows each).
+    fn row_of(index: usize) -> u16 {
+        2 + (index as u16) * 3
+    }
+
+    #[test]
+    fn a_click_on_a_session_row_switches_to_it() {
+        let mut app = app();
+
+        apply_ui_mouse(
+            &mut app,
+            UiMouse::Click {
+                x: 6,
+                y: row_of(1),
+                width: 40,
+                height: 40,
+            },
+        );
+
+        assert_eq!(app.focused_session_name(), Some("docs"));
+        assert_eq!(
+            app.drain_commands(),
+            vec![ClientCommand::SwitchSession {
+                name: "docs".to_string(),
+                client_tty: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn mouse_is_inert_while_a_modal_is_open() {
+        let mut app = app();
+        app.set_sidebar_focus(SidebarFocus::Session("docs".to_string()));
+        app.open_kill_confirm_for_focus();
+        assert!(matches!(app.modal, Modal::KillConfirm { .. }));
+
+        apply_ui_mouse(
+            &mut app,
+            UiMouse::Click {
+                x: 6,
+                y: row_of(0),
+                width: 40,
+                height: 40,
+            },
+        );
+        apply_ui_mouse(
+            &mut app,
+            UiMouse::ScrollDown {
+                x: 6,
+                y: row_of(0),
+                width: 40,
+                height: 40,
+            },
+        );
+
+        assert!(app.drain_commands().is_empty());
+        assert!(matches!(app.modal, Modal::KillConfirm { .. }));
+        assert_eq!(app.focused_session_name(), Some("docs"));
+    }
+
+    #[test]
+    fn clicks_right_after_a_chosen_arrival_are_the_double_clicks_tail() {
+        let mut app = app();
+        app.apply_server_message(ServerMessage::ActivateSession {
+            name: "work".to_string(),
+            source_pane_id: Some("%99".to_string()),
+            chosen: true,
+        });
+
+        assert!(app.ignores_clicks_at(Instant::now()));
+        apply_ui_mouse(
+            &mut app,
+            UiMouse::Click {
+                x: 6,
+                y: row_of(2),
+                width: 40,
+                height: 40,
+            },
+        );
+        assert!(app.drain_commands().is_empty());
+        assert_eq!(app.focused_session_name(), Some("work"));
+
+        assert!(!app.ignores_clicks_at(Instant::now() + Duration::from_millis(400)));
     }
 }

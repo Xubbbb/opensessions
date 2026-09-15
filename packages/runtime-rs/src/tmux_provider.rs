@@ -110,6 +110,8 @@ pub struct PaneInfo {
     pub dead: bool,
     /// The pane's window is the current window of its session.
     pub window_active: bool,
+    /// tmux's "last" pane of the window: the one active before the current.
+    pub last: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,24 +209,26 @@ impl TmuxClient {
         self.run(&args);
     }
 
-    pub fn select_sidebar_pane_for_session(&self, session_name: &str) {
-        let Some(window_id) = self
-            .list_windows()
-            .into_iter()
-            .find(|window| window.session_name == session_name && window.active)
-            .map(|window| window.id)
-        else {
-            return;
-        };
-        let Some(sidebar_pane) = self
-            .list_panes(PaneScope::Window(&window_id))
-            .into_iter()
-            .find(|pane| pane.title == "opensessions-sidebar")
-            .map(|pane| pane.id)
-        else {
-            return;
-        };
-        self.select_pane(&sidebar_pane);
+    /// If the client is looking at a sidebar pane, hand the window's focus
+    /// back to the content pane it came from (tmux's "last" pane, else the
+    /// first content pane). Used before switching the client away, so that
+    /// coming back to the window does not land keystrokes in the sidebar.
+    pub fn leave_sidebar_pane(&self, client_tty: Option<&str>) -> Option<String> {
+        let focus = self.get_client_focus(client_tty)?;
+        let panes = self.list_panes(PaneScope::Window(&focus.window_id));
+        let active = panes.iter().find(|pane| pane.id == focus.pane_id)?;
+        if !is_sidebar_pane(active) {
+            return None;
+        }
+        let content = panes.iter().filter(|pane| !is_sidebar_pane(pane));
+        let target = content
+            .clone()
+            .find(|pane| pane.last)
+            .or_else(|| content.clone().next())?
+            .id
+            .clone();
+        self.select_pane(&target);
+        Some(target)
     }
 
     pub fn new_session(&self, name: Option<&str>, cwd: Option<&str>) -> String {
@@ -503,6 +507,7 @@ impl MuxProvider for TmuxProvider {
             .into_iter()
             .filter(|session| session.name != STASH_SESSION)
             .map(|session| MuxSessionInfo {
+                id: session.id.clone(),
                 name: session.name.clone(),
                 created_at: session.created_at,
                 dir: active_dirs
@@ -515,6 +520,10 @@ impl MuxProvider for TmuxProvider {
     }
 
     fn switch_session(&self, name: &str, client_tty: Option<&str>) {
+        // Leaving through the sidebar must not leave the sidebar as the
+        // window's active pane: the user's next keystrokes there would move
+        // the selection or switch sessions instead of reaching their shell.
+        self.client.leave_sidebar_pane(client_tty);
         self.client.switch_client(name, client_tty);
     }
 
@@ -934,9 +943,12 @@ impl MuxProvider for TmuxProvider {
             .map(|session| session.name)
     }
 
-    fn pane_session_name(&self, pane_id: &str) -> Option<String> {
-        let name = self.client.display("#{session_name}", Some(pane_id));
-        (!name.is_empty()).then_some(name)
+    fn pane_session(&self, pane_id: &str) -> Option<(String, String)> {
+        let raw = self
+            .client
+            .display("#{session_id}\t#{session_name}", Some(pane_id));
+        let (id, name) = raw.split_once(SEP)?;
+        (!id.is_empty() && !name.is_empty()).then(|| (id.to_string(), name.to_string()))
     }
 
     fn nudge_dead_panes(&self) -> bool {
@@ -989,7 +1001,7 @@ fn client_format() -> &'static str {
 }
 
 fn pane_format() -> &'static str {
-    "#{pane_id}\t#{session_name}\t#{window_id}\t#{window_index}\t#{pane_index}\t#{pane_active}\t#{pane_tty}\t#{pane_pid}\t#{pane_current_path}\t#{pane_current_command}\t#{pane_title}\t#{pane_width}\t#{pane_height}\t#{pane_left}\t#{pane_right}\t#{pane_dead}\t#{window_active}"
+    "#{pane_id}\t#{session_name}\t#{window_id}\t#{window_index}\t#{pane_index}\t#{pane_active}\t#{pane_tty}\t#{pane_pid}\t#{pane_current_path}\t#{pane_current_command}\t#{pane_title}\t#{pane_width}\t#{pane_height}\t#{pane_left}\t#{pane_right}\t#{pane_dead}\t#{window_active}\t#{pane_last}"
 }
 
 /// tmux resolves a bare `-t <name>` on window/pane commands (`list-panes -s`,
@@ -1169,6 +1181,7 @@ fn parse_panes(raw: &str) -> Vec<PaneInfo> {
                 right: parse_u16(&parts, 14),
                 dead: part(&parts, 15) == "1",
                 window_active: part(&parts, 16) == "1",
+                last: part(&parts, 17) == "1",
             })
         })
         .collect()
@@ -1614,6 +1627,94 @@ mod tests {
         assert_eq!(detect_agent("example", "bash"), None);
         assert_eq!(detect_agent("claude-docs", "bash"), None);
         assert_eq!(detect_agent("sample notes", "vim"), None);
+    }
+
+    #[test]
+    fn pane_session_returns_the_live_id_and_name_of_a_pane() {
+        let runner = Arc::new(ScriptedRunner::new(HashMap::from([(
+            "display-message",
+            "$3\tcharlie2".to_string(),
+        )])));
+        let provider = TmuxProvider::new(runner.clone());
+
+        assert_eq!(
+            provider.pane_session("%7"),
+            Some(("$3".to_string(), "charlie2".to_string()))
+        );
+        assert_eq!(
+            runner.call("display-message"),
+            vec![
+                "display-message",
+                "-t",
+                "%7",
+                "-p",
+                "#{session_id}\t#{session_name}"
+            ]
+        );
+    }
+
+    #[test]
+    fn switching_from_a_sidebar_pane_hands_the_source_window_back_to_its_content_pane() {
+        let mut sidebar = full_pane_row(
+            "%5",
+            "alpha",
+            "@1",
+            true,
+            50,
+            "opensessions-sidebar",
+            "opensessions-sidebar",
+            false,
+            true,
+        );
+        sidebar.push_str("\t0");
+        let mut content =
+            full_pane_row("%3", "alpha", "@1", false, 30, "bash", "shell", false, true);
+        content.push_str("\t1");
+        let runner = Arc::new(ScriptedRunner::new(HashMap::from([
+            ("display-message", "/dev/pts/1\talpha\t@1\t%5".to_string()),
+            ("list-panes", [sidebar, content].join("\n")),
+        ])));
+        let provider = TmuxProvider::new(runner.clone());
+
+        provider.switch_session("bravo", None);
+
+        let calls = runner.calls.lock().unwrap();
+        let select = calls
+            .iter()
+            .position(|call| call.first().map(String::as_str) == Some("select-pane"))
+            .expect("select-pane call");
+        let switch = calls
+            .iter()
+            .position(|call| call.first().map(String::as_str) == Some("switch-client"))
+            .expect("switch-client call");
+        assert_eq!(calls[select], vec!["select-pane", "-t", "%3"]);
+        assert!(
+            select < switch,
+            "focus returns to the content pane before the client leaves"
+        );
+    }
+
+    #[test]
+    fn switching_from_a_content_pane_leaves_the_window_focus_alone() {
+        let mut content =
+            full_pane_row("%3", "alpha", "@1", true, 30, "bash", "shell", false, true);
+        content.push_str("\t0");
+        let runner = Arc::new(ScriptedRunner::new(HashMap::from([
+            ("display-message", "/dev/pts/1\talpha\t@1\t%3".to_string()),
+            ("list-panes", content),
+        ])));
+        let provider = TmuxProvider::new(runner.clone());
+
+        provider.switch_session("bravo", None);
+
+        assert!(
+            !runner
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|call| call.first().map(String::as_str) == Some("select-pane"))
+        );
     }
 
     #[test]

@@ -28,7 +28,9 @@ use opensessions_runtime::config::{
 use opensessions_runtime::debug_log::log_with_tag;
 use opensessions_runtime::git_info::{GitInfo, parse_git_info_output};
 use opensessions_runtime::metadata_store::SessionMetadataStore;
-use opensessions_runtime::mux::{ActiveWindow, ClientFocus, MuxPane, MuxProvider, SidebarPosition};
+use opensessions_runtime::mux::{
+    ActiveWindow, ClientFocus, MuxPane, MuxProvider, MuxSessionInfo, SidebarPosition,
+};
 use opensessions_runtime::pi_runtime_registry::{PiRuntimeRegistry, parse_pi_runtime_info};
 use opensessions_runtime::port_discovery::{PortDiscoveryInput, discover_session_ports};
 use opensessions_runtime::project_dir_session::{
@@ -178,6 +180,16 @@ pub trait StateSource: Send + Sync + 'static {
     }
 
     fn handle_switch_index(&self, _index: u32, _body: &str) -> Option<String> {
+        None
+    }
+
+    /// The `activate-session` broadcast a client command earns before it is
+    /// executed: the session the user just picked, if the command picks one.
+    fn chosen_activation_for(
+        &self,
+        _command: &Value,
+        _context: &ClientConnectionContext,
+    ) -> Option<String> {
         None
     }
 
@@ -1129,15 +1141,15 @@ impl StateSource for ReadOnlyMuxStateSource {
         // The sidebar reports the name its pane had when it was spawned; the
         // session may have been renamed since, so ask the mux which session
         // the pane is in now.
-        let session_name = context
-            .pane_id
-            .as_deref()
-            .and_then(|pane_id| {
-                self.providers
-                    .iter()
-                    .find_map(|provider| provider.pane_session_name(pane_id))
-            })
-            .unwrap_or_else(|| reported_name.to_string());
+        let live = context.pane_id.as_deref().and_then(|pane_id| {
+            self.providers
+                .iter()
+                .find_map(|provider| provider.pane_session(pane_id))
+        });
+        let (session_id, session_name) = match live {
+            Some((id, name)) => (Some(id), name),
+            None => (None, reported_name.to_string()),
+        };
         if session_name == "_os_stash" {
             return None;
         }
@@ -1166,11 +1178,14 @@ impl StateSource for ReadOnlyMuxStateSource {
             }
         }
         let client_tty = self.providers.first()?.get_client_tty();
-        Some(format!(
-            r#"{{"type":"your-session","name":{},"clientTty":{}}}"#,
-            json_string_or_null(Some(&session_name)),
-            json_string_or_null(Some(&client_tty)),
-        ))
+        Some(
+            serde_json::to_string(&SidebarServerMessage::YourSession {
+                name: session_name,
+                client_tty: Some(client_tty),
+                session_id,
+            })
+            .expect("your-session must serialize"),
+        )
     }
 
     fn handle_http_json(&self, path: &str, body: &Value) -> Option<String> {
@@ -1296,7 +1311,20 @@ impl StateSource for ReadOnlyMuxStateSource {
             }
             "/ensure-sidebar" => {
                 let spawned = self.ensure_sidebar(body);
+                // after-new-window / after-select-window fire for the window's
+                // session, which is not where the client is when a script
+                // created the window elsewhere; only a client arriving in the
+                // session is an arrival.
                 self.parse_hook_context(body)
+                    .filter(|context| {
+                        let client_session = self.providers.iter().find_map(|provider| {
+                            provider
+                                .get_client_focus(context.client_tty.as_deref())
+                                .map(|focus| focus.session_name)
+                                .or_else(|| provider.get_current_session())
+                        });
+                        client_session.is_none_or(|session| session == context.session)
+                    })
                     .map(|context| activate_session_json(context.session, None, false))
                     .or_else(|| spawned.then(|| self.snapshot_json()))
             }
@@ -1347,6 +1375,38 @@ impl StateSource for ReadOnlyMuxStateSource {
     fn handle_switch_index(&self, index: u32, body: &str) -> Option<String> {
         let client_tty = parse_context(body).and_then(|context| context.client_tty);
         self.switch_visible_index(index, client_tty.as_deref())
+    }
+
+    fn chosen_activation_for(
+        &self,
+        command: &Value,
+        context: &ClientConnectionContext,
+    ) -> Option<String> {
+        match command.get("type").and_then(Value::as_str)? {
+            "switch-session" => {
+                let name = command.get("name")?.as_str()?.to_string();
+                Some(activate_session_json(
+                    name,
+                    context.pane_id.as_deref(),
+                    true,
+                ))
+            }
+            // Killing the session the client is in moves it to a neighbour
+            // the user implicitly picked with `x`: that neighbour's sidebars
+            // select it like any other destination.
+            "kill-session" => {
+                let name = command.get("name")?.as_str()?;
+                let provider = self.providers.first()?;
+                if provider.get_current_session().as_deref() != Some(name) {
+                    return None;
+                }
+                let next = self
+                    .sidebar_display_session_names()
+                    .and_then(|names| neighbour_session(&names, name))?;
+                Some(activate_session_json(next, None, true))
+            }
+            _ => None,
+        }
     }
 }
 
@@ -1854,9 +1914,17 @@ impl ReadOnlyMuxStateSource {
     }
 
     fn visible_session_names(&self) -> Option<Vec<String>> {
-        let names = self.sorted_session_names();
+        let sessions = self.sorted_sessions();
+        let names = sessions
+            .iter()
+            .map(|session| session.name.clone())
+            .collect::<Vec<_>>();
         let mut session_order = self.session_order.lock().unwrap();
-        session_order.sync(names.clone());
+        session_order.sync(
+            sessions
+                .into_iter()
+                .map(|session| ((!session.id.is_empty()).then_some(session.id), session.name)),
+        );
         if let Some(current_session) = self
             .providers
             .iter()
@@ -1868,6 +1936,13 @@ impl ReadOnlyMuxStateSource {
     }
 
     fn sorted_session_names(&self) -> Vec<String> {
+        self.sorted_sessions()
+            .into_iter()
+            .map(|session| session.name)
+            .collect()
+    }
+
+    fn sorted_sessions(&self) -> Vec<MuxSessionInfo> {
         let mut sessions = self
             .providers
             .iter()
@@ -1878,7 +1953,7 @@ impl ReadOnlyMuxStateSource {
                 .cmp(&b.created_at)
                 .then_with(|| a.name.cmp(&b.name))
         });
-        sessions.into_iter().map(|session| session.name).collect()
+        sessions
     }
 }
 
@@ -2635,12 +2710,6 @@ fn current_time_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn json_string_or_null(value: Option<&str>) -> String {
-    value
-        .map(|value| serde_json::to_string(value).expect("string must serialize"))
-        .unwrap_or_else(|| "null".to_string())
-}
-
 fn activate_session_json(name: String, source_pane_id: Option<&str>, chosen: bool) -> String {
     serde_json::to_string(&SidebarServerMessage::ActivateSession {
         name,
@@ -3274,12 +3343,11 @@ async fn handle_connection(
                                 {
                                     websocket.send(Message::text(reply)).await?;
                                 }
-                                if let Some(name) = switch_session_target(&command) {
-                                    let _ = state_updates.send(activate_session_json(
-                                        name,
-                                        client_context.pane_id.as_deref(),
-                                        true,
-                                    ));
+                                if let Some(activation) = state_source
+                                    .as_ref()
+                                    .and_then(|state_source| state_source.chosen_activation_for(&command, &client_context))
+                                {
+                                    let _ = state_updates.send(activation);
                                     tokio::task::yield_now().await;
                                 }
                                 if let Some(payload) = state_source
@@ -3321,7 +3389,12 @@ async fn handle_connection(
                         }
                         Err(broadcast::error::RecvError::Closed) => return Ok(()),
                         Err(broadcast::error::RecvError::Lagged(n)) => {
+                            // Skipped messages are gone; a fresh snapshot at
+                            // least brings the list and markers back in sync.
                             debug_log(format!("ws: state_rx lagged by {n} messages"));
+                            if let Some(state_source) = &state_source {
+                                pending_state = Some(state_source.snapshot_json());
+                            }
                         }
                     }
                 }
@@ -3518,11 +3591,6 @@ fn is_client_view_command(command: &Value) -> bool {
         command.get("type").and_then(Value::as_str),
         Some("switch-session" | "switch-index")
     )
-}
-
-fn switch_session_target(command: &Value) -> Option<String> {
-    (command.get("type").and_then(Value::as_str) == Some("switch-session"))
-        .then(|| command.get("name")?.as_str().map(str::to_string))?
 }
 
 fn is_immediate_server_message(payload: &str) -> bool {

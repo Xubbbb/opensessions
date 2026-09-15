@@ -30,7 +30,7 @@ Each tmux server/socket gets its own opensessions server and its own sidebar sta
 The practical product behavior is:
 
 - every sidebar pane inside the same tmux server shows the same session list, filters, lifecycle state, collapsed groups, and Fixed Sidebar Width
-- each attached tmux client owns its own confirmed active row and temporary keyboard focus
+- each sidebar pane owns its own row (`▌`, the session it lives in) and its selection (`›`); neither is server-synced
 - manual tmux-driven width changes are rejected and repaired back to the server-owned width
 - a different tmux server may have a different opensessions width/state/server without conflict
 - stale hooks or sidebars talking to another port are considered broken configuration, not valid mixed-server behavior
@@ -58,11 +58,13 @@ Expected shutdown behavior:
 - the server waits briefly for clients to receive the quit frame, then removes hooks and pid file
 - restarting the same tmux server should create a fresh server/client generation, not reuse stale sidebars from a previous generation
 
-### Session switching keeps the sidebar in control
+### Session switching hands the keyboard back to content
 
-Clicking a tmux session in the sidebar should switch to that session and leave focus in that session's sidebar pane. This keeps the global sidebar interaction continuous while navigating.
+Leaving a session through its sidebar (Enter, click, `Tab`, `1`–`9`, the index keys, killing the current session) first hands that window's focus back to the content pane the user came from (tmux's "last" pane, else the first content pane), then switches the client. Otherwise tmux would remember the sidebar as the window's active pane and every later arrival there would feed the shell's keystrokes to the sidebar (`j`/`k` moving the selection, `q` quitting opensessions). The destination window keeps whatever pane tmux remembers for it; the sidebar never takes the keyboard unless the user puts it there (the focus key, a click).
 
 Agent-row activation is different: it may switch sessions first, then intentionally focus the target agent pane.
+
+A double-click's second press lands in the destination sidebar (tmux routes it to the pane at the same cells in the client's new window), so a sidebar ignores clicks for 300 ms after a chosen arrival. Mouse input is inert while a modal (kill/hide confirmation, worktree prompt) is open.
 
 ### Pane exits must not let tmux steal sidebar space
 
@@ -141,19 +143,19 @@ That means:
 - switching must not reset the width to an older value
 - transient sidebar widths produced while tmux settles after a session/window switch must not redefine the global width
 - switching immediately after any manual/sidebar/tmux resize still converges to Fixed Sidebar Width; no observed pane width is adopted as the new width
-- switching from a sidebar session row should leave focus on the destination sidebar pane, not the destination main pane
+- switching from a sidebar session row hands the source window's focus back to its content pane; the destination window keeps whatever pane tmux remembers for it
 
-The sidebar session list has one durable local active row: this tmux client's confirmed active session. The keyboard-focused row may temporarily diverge while the user browses with `j`/`k`/arrow keys, but that temporary selection is local-only and must not be server-synced. `Enter` switches to the temporary selection and keeps that row visible as the pending switch target until `YourSession`/pane identity confirms the new context; it must not snap back to the old active row for an intermediate frame. `Tab`/`Shift-Tab` are the only keys that immediately switch to the next/previous visible session without first moving temporary focus. Mouse clicks on sessions also make the clicked concrete session the pending focus target. In all cases, the durable active row stays on the confirmed active session until confirmation.
+Every sidebar pane knows two rows. Its own session (`▌`) is the tmux session the pane lives in, learned from `YourSession` at identification and re-learned on the `session-renamed` hook; it is keyed by tmux session id (`$n`), so renames follow the same row and keep its place in the persisted order. The selected row (`›`) is local to the pane and is never server-synced. The selection is sticky: it moves only when the user moves it (`j`/`k`/arrows, `Tab`), when the user picks a session (Enter, click, `1`–`9`, the index keys, opening an agent, or killing the current session — the sidebars in the destination then show that session selected, as the row the user chose), or when its row disappears. A client merely arriving in a session through tmux itself (`choose-tree`, `switch-client`, a window created elsewhere by a script) is `ActivateSession { chosen: false }` and leaves every selection where the user put it; `/ensure-sidebar` only reports an arrival when the client is actually in that session.
 
-Worktree group headers are normal temporary focus targets. `j`/`k`/arrow navigation can land on them, and `Enter` toggles collapse/expand. Once the user chooses a concrete child session inside an expanded worktree group, pending focus moves from the group header to that child session row; the group header must not remain focused in the destination session.
+`Enter` switches to the selected row and keeps it selected as the pending switch target until the client rests in the target or in a third session; it must not snap back to the own row for an intermediate frame. `Tab`/`Shift-Tab` switch to the next/previous visible session relative to the own session without first moving the selection, and do nothing at the list boundary. Mouse clicks on session rows switch like Enter.
 
-Temporary focus must not look like active focus. The confirmed active row owns the strong green active marker; a temporary keyboard selection uses a weaker cursor marker. Otherwise a normal `j`/`k` browse shows two active-looking rows and feels like focus randomly split.
+Worktree group headers are normal selection targets. `j`/`k`/arrow navigation can land on them, and `Enter` toggles collapse/expand. When a selected child's group is collapsed elsewhere, the selection lands on the group header; when a group dissolves to one member, on that member.
 
-Temporary focus is allowed to diverge only until a concrete activation/switch-settled event. When tmux activates session B, every sidebar pane whose own confirmed local session is B must reset its keyboard focus back to B. This is a session-scoped reset: if session B has sidebars in multiple tmux windows, all of B's sidebars reset; sidebars belonging to other sessions keep their own local temporary focus. The reset is triggered by the settled switch/activation event, not by generic websocket state snapshots or server-owned global focus.
+The selected row must not look like the own row. The own row owns the strong active marker; the selection uses a weaker cursor marker. Otherwise a normal `j`/`k` browse shows two active-looking rows and feels like focus randomly split.
 
-When `Enter` or `Tab` switches from session A to session B, the old A sidebar remains alive in the background. If A keeps `pending=B` forever, returning to A later replays stale focus and feels random. A server `Focus` broadcast is only a fast intent echo and can arrive before tmux visibly switches the attached client, so it must not clear pending state. A settled `State` snapshot for B is allowed to clean up this one local case: if a sidebar has `pending=B` but its own local session is still A, it clears pending and rehomes focus to A. This does not make server focus authoritative; it only cleans up the source pane after its switch request moved the attached tmux client elsewhere.
+When the selected row disappears (killed, hidden by a filter, moved into a collapsed group) the selection rehomes: to the group header that now holds it, else to the own row when it is listed, else to nothing (an own session hidden by a filter never becomes an invisible selection). A pending switch whose target vanished is dropped, and an activation of another session that did not come from this sidebar supersedes its pending target, so a stale target never becomes a rehome destination later.
 
-This keeps per-window state simple: every attached tmux client can show a different active session row if that client is in a different tmux session, while shared server state still provides the common session list, width, filters, collapsed groups, and lifecycle labels. Server focus broadcasts are compatibility hints only; they must not move a client's local active/focused session row.
+This keeps per-window state simple: every attached tmux client can show a different own row if that client is in a different tmux session, while shared server state still provides the common session list, width, filters, collapsed groups, and lifecycle labels. Server-driven selection moves are logged as `[sidebar-core] focus moved by server message …` when `OPENSESSIONS_DEBUG_LOG` is set, so a selection that "jumped" can be traced to the message that moved it.
 
 One specific regression we already paid for: forcing `resize-window` during the session-switch path caused visible layout jumps. The fix was to stop doing that in the switch path and instead use targeted width enforcement plus background pre-layout where appropriate.
 
@@ -352,7 +354,8 @@ Before shipping any sidebar behavior change, verify all of these.
 - manually resizing the active sidebar snaps back to Fixed Sidebar Width
 - manually resizing the sidebar divider while focus remains in the main pane snaps back to Fixed Sidebar Width
 - switching sessions immediately after manual/sidebar/tmux resize preserves Fixed Sidebar Width
-- clicking a session row leaves focus in the destination sidebar pane
+- switching from a sidebar hands the source window's focus back to its content pane; the destination keeps its own
+- a plain tmux switch back to a session leaves its sidebars' selections where the user put them; a chosen switch selects the destination there
 - resizing the whole terminal does not redefine the persisted width
 - in `sidebar | pane1 | pane2`, killing or exiting `pane1` leaves `sidebar` fixed-width and lets `pane2` absorb the freed width
 - background windows land at the current width without visible proportional flash

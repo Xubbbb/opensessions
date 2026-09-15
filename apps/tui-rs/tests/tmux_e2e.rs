@@ -305,6 +305,10 @@ fn tmux_sidebar_keeps_the_selected_row_when_the_client_returns_to_the_session() 
             && !has_non_active_focus_marker(text, "effect-ts")
     });
     lab.tmux_ok(["select-pane", "-t", effect.as_str()]);
+    // A click within the double-click window of the arrival is swallowed as
+    // the tail of the double-click that brought the user here; a person
+    // clicking on purpose is slower than that.
+    sleep(Duration::from_millis(400));
     lab.click_session_row(&effect, "opensessions");
     lab.wait_for_client_session("opensessions");
     for pane in [&source, &second] {
@@ -475,6 +479,112 @@ fn tmux_sidebar_keeps_session_and_agent_panel_seen_state_in_sync_per_focused_pan
             && text.lines().any(|line| line.contains("✓ Agent Two"))
             && !text.lines().any(|line| line.contains("● Agent"))
     });
+}
+
+#[test]
+fn tmux_sidebar_selects_the_neighbour_after_killing_the_current_session() {
+    let _guard = e2e_serial_guard();
+    let lab = started_lab("opensessions-e2e-kill-neighbour");
+    // Display order: effect-ts, lazydiff, opensessions, ... — killing lazydiff
+    // from inside it lands the client on effect-ts, its previous neighbour.
+    let effect = lab.sidebar_pane("effect-ts");
+    lab.tmux_ok(["switch-client", "-t", "effect-ts"]);
+    lab.tmux_ok(["select-pane", "-t", effect.as_str()]);
+    lab.move_focus_off_active(&effect, "effect-ts");
+    assert!(has_non_active_focus_marker(
+        &lab.capture_pane(&effect),
+        "effect-ts"
+    ));
+
+    lab.tmux_ok(["switch-client", "-t", "lazydiff"]);
+    lab.wait_for_client_session("lazydiff");
+    let lazydiff = lab.sidebar_pane("lazydiff");
+    lab.send_sidebar_key(&lazydiff, "x");
+    lab.send_sidebar_key(&lazydiff, "y");
+
+    lab.wait_for_client_session("effect-ts");
+    lab.wait_for_session_absent("lazydiff");
+    // The user picked the neighbour by killing what they were in: its sidebar
+    // selects it instead of keeping the earlier selection.
+    lab.wait_for_capture_pane(&effect, |text| {
+        row_with(text, "effect-ts").is_some_and(|row| row.contains("▌"))
+            && !has_non_active_focus_marker(text, "effect-ts")
+    });
+}
+
+#[test]
+fn tmux_sidebar_switch_from_a_sidebar_returns_keyboard_focus_to_the_content_pane() {
+    let _guard = e2e_serial_guard();
+    let lab = started_lab("opensessions-e2e-leave-sidebar-focus");
+    let source = lab.sidebar_pane("opensessions");
+    let main = lab.main_pane("opensessions");
+    lab.tmux_ok(["switch-client", "-t", "opensessions"]);
+    lab.tmux_ok(["select-pane", "-t", source.as_str()]);
+    lab.wait_for_active_pane(&source);
+
+    // Enter on the row above (lazydiff) from the sidebar.
+    lab.tmux_ok(["send-keys", "-t", source.as_str(), "Up"]);
+    lab.wait_for_capture_pane(&source, |text| {
+        row_with(text, "lazydiff").is_some_and(|row| row.contains('›'))
+    });
+    lab.tmux_ok(["send-keys", "-t", source.as_str(), "Enter"]);
+    lab.wait_for_client_session("lazydiff");
+
+    // Back in the source window, the content pane has the keyboard again.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let active = lab.tmux([
+            "display-message",
+            "-p",
+            "-t",
+            "=opensessions:",
+            "#{pane_id}",
+        ]);
+        if active == main {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "source window should hand focus back to its content pane {main}, active={active}\n{}",
+            lab.logs()
+        );
+        sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn tmux_sidebar_a_window_created_in_another_session_is_not_an_arrival() {
+    let _guard = e2e_serial_guard();
+    let lab = started_lab("opensessions-e2e-window-elsewhere");
+    lab.tmux_ok(["switch-client", "-t", "opensessions"]);
+    lab.wait_for_client_session("opensessions");
+    let lazydiff = lab.sidebar_pane("lazydiff");
+    lab.move_focus_off_active(&lazydiff, "lazydiff");
+    let selected = lab
+        .capture_pane(&lazydiff)
+        .lines()
+        .find(|line| line.contains('›'))
+        .map(str::to_string)
+        .expect("a selected row in the lazydiff sidebar");
+
+    // A script opens a window in lazydiff while the client stays put: the
+    // after-new-window hook fires for lazydiff, but nobody arrived there.
+    lab.spawn_window_with_sidebar("lazydiff", "aside");
+    sleep(Duration::from_millis(500));
+    let debug_log = fs::read_to_string(lab.root.join("debug.log")).unwrap_or_default();
+    assert!(
+        !debug_log.contains("ActivateSession { name: \"lazydiff\""),
+        "a window created elsewhere must not activate its session:\n{debug_log}"
+    );
+    assert_eq!(
+        lab.tmux(["list-clients", "-F", "#{client_session}"]).trim(),
+        "opensessions"
+    );
+    let capture = lab.capture_pane(&lazydiff);
+    assert!(
+        capture.lines().any(|line| line == selected),
+        "the lazydiff sidebar keeps its selection; wanted {selected:?}, got:\n{capture}"
+    );
 }
 
 #[test]
@@ -1566,6 +1676,7 @@ time.sleep(300)
 
     fn spawn_sidebars(&self) {
         let sidebar = self.sidebar_bin();
+        let mut spawned = Vec::new();
         for session in SIDEBAR_SESSIONS {
             let command = format!(
                 "env OPENSESSIONS_HOST=127.0.0.1 OPENSESSIONS_PORT={} OPENSESSIONS_DEBUG_LOG={} {} 2>{}",
@@ -1599,8 +1710,33 @@ time.sleep(300)
                 "-T",
                 "opensessions-sidebar",
             ]);
+            spawned.push((*session, pane));
         }
-        sleep(Duration::from_millis(1200));
+        // A sidebar hands the window's focus back to the content pane once
+        // it has drawn its first frame. Tests move focus themselves right
+        // after this, so wait for that refocus instead of racing it.
+        for (session, pane) in spawned {
+            self.wait_for_capture_pane(&pane, |text| text.contains("sessions"));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let active = self.tmux([
+                    "display-message",
+                    "-p",
+                    "-t",
+                    &exact_session_target(session),
+                    "#{pane_id}",
+                ]);
+                if !active.is_empty() && active != pane {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "sidebar {pane} in {session} never handed focus back (active={active})\n{}",
+                    self.logs()
+                );
+                sleep(Duration::from_millis(50));
+            }
+        }
     }
 
     fn spawn_window_with_sidebar(&self, session: &str, window_name: &str) -> String {
@@ -1663,7 +1799,7 @@ time.sleep(300)
             "sh -c 'printf \"\\033]2;{}\\033\\\\\"; while :; do sleep 60; done'",
             title.replace('"', "")
         );
-        let pane = self.tmux([
+        self.tmux([
             "split-window",
             "-h",
             "-d",
@@ -1673,8 +1809,7 @@ time.sleep(300)
             "-t",
             session,
             &command,
-        ]);
-        pane
+        ])
     }
 
     fn post_agent_event(

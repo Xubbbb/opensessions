@@ -70,6 +70,9 @@ pub enum KillTarget {
 
 /// How long a footer notice stays visible.
 const NOTICE_DURATION: Duration = Duration::from_millis(2_500);
+/// tmux's double-click window: clicks this soon after a chosen arrival are
+/// the second press of the double-click that switched sessions.
+const ARRIVAL_CLICK_GUARD: Duration = Duration::from_millis(300);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Modal {
@@ -93,6 +96,8 @@ pub struct App {
     pub sidebar_focus: Option<SidebarFocus>,
     pub current_session: Option<String>,
     pub my_session: Option<String>,
+    /// Mux id of the own session, so a rename is followed by identity.
+    my_session_id: Option<String>,
     pub initializing: bool,
     pub init_label: Option<String>,
     pub sidebar_width: u16,
@@ -112,6 +117,11 @@ pub struct App {
     pub flash_deadline: Option<Instant>,
     /// Short-lived message shown in place of the footer hints.
     notice: Option<(String, Instant)>,
+    /// When a chosen activation last landed here. tmux routes the second
+    /// press of a double-click to whatever pane sits at those cells in the
+    /// client's new window — this sidebar — so clicks right after arriving
+    /// are the tail of the click that brought the user here.
+    arrived_at: Option<Instant>,
     pub hover_target: Option<HitTarget>,
     pub modal: Modal,
     pub detail_panel_height: usize,
@@ -145,6 +155,7 @@ impl App {
             sidebar_focus: None,
             current_session: None,
             my_session: None,
+            my_session_id: None,
             initializing: state.initializing,
             init_label: state.init_label,
             sidebar_width: state.sidebar_width.min(u16::MAX as u32) as u16,
@@ -159,6 +170,7 @@ impl App {
             flash_target: None,
             flash_deadline: None,
             notice: None,
+            arrived_at: None,
             hover_target: None,
             modal: Modal::None,
             detail_panel_height: state
@@ -228,7 +240,15 @@ impl App {
             session_name: session_name.clone(),
             window_id,
         });
+        self.my_session_id = self.session_id_for(&session_name);
         self.confirm_local_session(session_name, true);
+    }
+
+    fn session_id_for(&self, name: &str) -> Option<String> {
+        self.sessions
+            .iter()
+            .find(|session| session.name == name)
+            .and_then(|session| session.id.clone())
     }
 
     fn confirm_local_session(&mut self, session_name: String, update_focus: bool) {
@@ -241,10 +261,80 @@ impl App {
             self.pending_switch_session = None;
         }
         if update_focus {
-            let focus = self
-                .visible_focus_for_session(&session_name)
-                .unwrap_or_else(|| SidebarFocus::Session(session_name.clone()));
-            self.set_focus_for_session_if_changed(&session_name, focus);
+            // Only a row that is on screen can be selected; an own session
+            // hidden by the filter leaves the selection where it is (or on
+            // the first row when there is none).
+            if let Some(focus) = self.visible_focus_for_session(&session_name) {
+                self.set_focus_for_session_if_changed(&session_name, focus);
+            } else if self
+                .sidebar_focus
+                .as_ref()
+                .is_none_or(|focus| !self.focus_exists(focus))
+            {
+                self.sidebar_focus = self.display_session_entries().first().map(entry_focus);
+                self.session_scroll_follows_focus = true;
+            }
+        }
+    }
+
+    /// Sessions carry a stable mux id: when a name changed between two
+    /// states, every reference to the old name follows it, so a rename is
+    /// neither a vanished row nor a lost identity.
+    fn follow_session_renames(&mut self, previous: &[SessionData]) {
+        let mut renames = previous
+            .iter()
+            .filter_map(|old| {
+                let id = old.id.as_deref()?;
+                let new = self
+                    .sessions
+                    .iter()
+                    .find(|session| session.id.as_deref() == Some(id))?;
+                (new.name != old.name).then(|| (old.name.clone(), new.name.clone()))
+            })
+            .collect::<Vec<_>>();
+        if let (Some(id), Some(mine)) = (self.my_session_id.as_deref(), self.my_session.as_deref())
+            && let Some(new) = self
+                .sessions
+                .iter()
+                .find(|session| session.id.as_deref() == Some(id))
+            && new.name != mine
+            && !renames.iter().any(|(old, _)| old == mine)
+        {
+            renames.push((mine.to_string(), new.name.clone()));
+        }
+        for (old, new) in renames {
+            self.rename_session_refs(&old, &new);
+        }
+    }
+
+    fn rename_session_refs(&mut self, old: &str, new: &str) {
+        for slot in [
+            &mut self.my_session,
+            &mut self.current_session,
+            &mut self.pending_switch_session,
+            &mut self.group_focus_surrogate_for,
+            &mut self.last_activated_session,
+        ] {
+            if slot.as_deref() == Some(old) {
+                *slot = Some(new.to_string());
+            }
+        }
+        if let Some(identity) = &mut self.pane_identity
+            && identity.session_name == old
+        {
+            identity.session_name = new.to_string();
+        }
+        if self.sidebar_focus == Some(SidebarFocus::Session(old.to_string())) {
+            // In place: the row did not move, so neither scroll nor panel
+            // state should.
+            self.sidebar_focus = Some(SidebarFocus::Session(new.to_string()));
+        }
+        if let Modal::KillConfirm {
+            target: KillTarget::Session(name),
+        } = &mut self.modal
+            && name == old
+        {
+            *name = new.to_string();
         }
     }
 
@@ -276,7 +366,8 @@ impl App {
             ServerMessage::State(state) => {
                 let previous_focus = self.sidebar_focus.clone();
                 let server_current = state.current_session.clone();
-                self.sessions = state.sessions;
+                let previous_sessions = std::mem::replace(&mut self.sessions, state.sessions);
+                self.follow_session_renames(&previous_sessions);
                 self.initializing = state.initializing;
                 self.init_label = state.init_label;
                 self.apply_server_sidebar_width(state.sidebar_width.min(u16::MAX as u32) as u16);
@@ -295,11 +386,12 @@ impl App {
                     state.collapsed_worktree_groups.into_iter().collect();
                 self.clear_missing_pending_switch();
                 self.rehome_expanded_group_surrogate();
-                let focus_still_exists = previous_focus
+                let focus_still_exists = self
+                    .sidebar_focus
                     .as_ref()
                     .is_some_and(|focus| self.focus_exists(focus));
                 if !focus_still_exists {
-                    self.rehome_missing_focus();
+                    self.rehome_missing_focus(previous_focus.as_ref());
                 }
                 self.clear_background_pending_switch(server_current.as_deref());
                 // Keep the user's scroll position; only pull it back if the
@@ -309,13 +401,16 @@ impl App {
                 self.session_scroll_offset =
                     self.session_scroll_offset.min(entries.saturating_sub(1));
             }
-            ServerMessage::YourSession { name, .. } => {
+            ServerMessage::YourSession {
+                name, session_id, ..
+            } => {
                 // The server names the session this sidebar's pane is in right
                 // now. The first answer places the selection on the own row;
                 // later ones (re-identification after a rename) only refresh
                 // the identity, moving the selection along if it sat on the
                 // old name of this very session.
                 let previous = self.my_session.clone();
+                self.my_session_id = session_id.or_else(|| self.session_id_for(&name));
                 self.confirm_local_session(name.clone(), previous.is_none());
                 if let Some(previous) = previous
                     && previous != name
@@ -337,12 +432,6 @@ impl App {
                 chosen,
             } => {
                 let previous_activated = self.last_activated_session.replace(name.clone());
-                // Any activation of another session supersedes a switch this
-                // sidebar requested earlier; a stale target must not become
-                // the rehome destination later (see rehome_missing_focus).
-                if self.pending_switch_session.as_deref() != Some(name.as_str()) {
-                    self.pending_switch_session = None;
-                }
                 let from_this_pane = self
                     .pane_identity
                     .as_ref()
@@ -352,6 +441,15 @@ impl App {
                             .map(|source| source == &identity.pane_id)
                     })
                     .unwrap_or(false);
+                // An activation of another session that did not come from this
+                // sidebar supersedes a switch it requested earlier; a stale
+                // target must not become a rehome destination later. The echo
+                // of this sidebar's own switch keeps its (possibly newer)
+                // pending target.
+                if !from_this_pane && self.pending_switch_session.as_deref() != Some(name.as_str())
+                {
+                    self.pending_switch_session = None;
+                }
                 if from_this_pane || self.confirmed_local_session_name() != Some(name.as_str()) {
                     return;
                 }
@@ -360,6 +458,7 @@ impl App {
                 // A client merely arriving here (a tmux switch) leaves the
                 // selection where the user put it.
                 if chosen {
+                    self.arrived_at = Some(Instant::now());
                     self.confirm_local_session(name, true);
                 } else if previous_activated.as_deref() != Some(name.as_str()) {
                     self.confirm_local_session(name, false);
@@ -543,9 +642,11 @@ impl App {
     }
 
     fn set_focus_for_session_if_changed(&mut self, session_name: &str, focus: SidebarFocus) {
-        let surrogate_changed = matches!(focus, SidebarFocus::WorktreeGroup(_))
-            && self.group_focus_surrogate_for.as_deref() != Some(session_name);
-        if self.sidebar_focus.as_ref() != Some(&focus) || surrogate_changed {
+        let surrogate =
+            matches!(focus, SidebarFocus::WorktreeGroup(_)).then(|| session_name.to_string());
+        if self.sidebar_focus.as_ref() != Some(&focus)
+            || self.group_focus_surrogate_for != surrogate
+        {
             self.set_sidebar_focus_for_session(session_name, focus);
         }
     }
@@ -576,7 +677,6 @@ impl App {
             .as_deref()
             .or(self.current_session.as_deref())?;
         self.visible_focus_for_session(name)
-            .or_else(|| Some(SidebarFocus::Session(name.to_string())))
     }
 
     pub fn handle_key_char(&mut self, key: char) {
@@ -658,11 +758,16 @@ impl App {
             .or_else(|| {
                 self.local_session_focus()
                     .and_then(|focus| targets.iter().position(|target| target == &focus))
-            })
-            .unwrap_or(0);
+            });
         let max_idx = targets.len() - 1;
-        let next_idx = (current_idx as i16 + delta as i16).clamp(0, max_idx as i16) as usize;
-        if next_idx != current_idx {
+        // With no anchor on screen the selection starts at the edge the
+        // user moved towards, instead of skipping the first row.
+        let next_idx = match current_idx {
+            Some(current) => (current as i16 + delta as i16).clamp(0, max_idx as i16) as usize,
+            None if delta < 0 => max_idx,
+            None => 0,
+        };
+        if current_idx != Some(next_idx) {
             self.set_sidebar_focus(targets[next_idx].clone());
         }
     }
@@ -835,6 +940,13 @@ impl App {
     /// `apply_server_message` stores on `self.theme`.
     pub fn set_theme_request(&mut self, theme: String) {
         self.commands.push(ClientCommand::SetTheme { theme });
+    }
+
+    /// Whether a click at `now` is the click-through of the double-click
+    /// that just brought the user to this sidebar's session.
+    pub fn ignores_clicks_at(&self, now: Instant) -> bool {
+        self.arrived_at
+            .is_some_and(|arrived| now.duration_since(arrived) < ARRIVAL_CLICK_GUARD)
     }
 
     /// Show a short message in the footer for a couple of seconds.
@@ -1075,7 +1187,6 @@ impl App {
             self.group_focus_surrogate_for =
                 matches!(focus, SidebarFocus::WorktreeGroup(_)).then(|| target.session.clone());
             self.sidebar_focus = Some(focus);
-            self.focused_agent_idx = 0;
             self.session_scroll_follows_focus = true;
         }
         self.commands.push(ClientCommand::SwitchSession {
@@ -1169,9 +1280,7 @@ impl App {
 
     fn rehome_focus_to_local_session(&mut self) {
         if let Some(name) = self.confirmed_local_session_name().map(str::to_string)
-            && let Some(focus) = self
-                .visible_focus_for_session(&name)
-                .or_else(|| Some(SidebarFocus::Session(name.clone())))
+            && let Some(focus) = self.visible_focus_for_session(&name)
         {
             self.set_focus_for_session_if_changed(&name, focus);
         } else if self
@@ -1184,7 +1293,31 @@ impl App {
         }
     }
 
-    fn rehome_missing_focus(&mut self) {
+    /// The selected row is no longer listed. Prefer whatever now stands in
+    /// for it (a collapsed group header, the remaining member of a dissolved
+    /// group), then a switch this sidebar is waiting for, then the own row.
+    fn rehome_missing_focus(&mut self, previous: Option<&SidebarFocus>) {
+        match previous {
+            Some(SidebarFocus::Session(name)) => {
+                if let Some(focus) = self.visible_focus_for_session(name) {
+                    let name = name.clone();
+                    self.set_focus_for_session_if_changed(&name, focus);
+                    return;
+                }
+            }
+            Some(SidebarFocus::WorktreeGroup(key)) => {
+                if let Some(member) = self
+                    .display_sessions()
+                    .into_iter()
+                    .find(|session| worktree_group_key(session).as_deref() == Some(key.as_str()))
+                    .map(|session| session.name.clone())
+                {
+                    self.set_sidebar_focus(SidebarFocus::Session(member));
+                    return;
+                }
+            }
+            None => {}
+        }
         if let Some(pending) = self.pending_switch_session.clone()
             && let Some(focus) = self.visible_focus_for_session(&pending)
         {
@@ -1211,15 +1344,18 @@ impl App {
         let Some(broadcast_session) = broadcast_session else {
             return;
         };
-        if self.pending_switch_session.as_deref() != Some(broadcast_session) {
+        let Some(pending) = self.pending_switch_session.as_deref() else {
             return;
+        };
+        // While the client is still in this sidebar's own session the switch
+        // is in flight; once it rests in the target or in a third session the
+        // request is over. The row it targeted stays selected here so this
+        // sidebar keeps showing what the user last chose.
+        if broadcast_session == pending
+            || self.confirmed_local_session_name() != Some(broadcast_session)
+        {
+            self.pending_switch_session = None;
         }
-        if self.confirmed_local_session_name() == Some(broadcast_session) {
-            return;
-        }
-        // The switch landed elsewhere; the row it targeted stays selected
-        // here so this sidebar keeps showing what the user last chose.
-        self.pending_switch_session = None;
     }
 
     fn clear_missing_pending_switch(&mut self) {
@@ -1254,13 +1390,17 @@ impl App {
         }
 
         let anchor = self.local_session_name();
-        let current_idx = anchor
-            .and_then(|name| names.iter().position(|candidate| candidate == name))
-            .unwrap_or(0);
+        let current_idx =
+            anchor.and_then(|name| names.iter().position(|candidate| candidate == name));
         let max_idx = names.len() - 1;
-        let next_idx = (current_idx as i16 + delta as i16).clamp(0, max_idx as i16) as usize;
-        if next_idx == current_idx {
-            self.rehome_focus_to_local_session();
+        let next_idx = match current_idx {
+            Some(current) => (current as i16 + delta as i16).clamp(0, max_idx as i16) as usize,
+            None if delta < 0 => max_idx,
+            None => 0,
+        };
+        // At the list boundary there is nothing to switch to; the selection
+        // the user browsed to is left alone.
+        if current_idx == Some(next_idx) {
             return;
         }
         self.request_session_switch(names[next_idx].clone(), false);
@@ -1371,6 +1511,11 @@ impl App {
     }
 
     fn focused_agents_len(&self) -> usize {
+        // The agents panel renders nothing without a focused session (a group
+        // row is selected), so there is nothing to navigate either.
+        if self.focused_session_name().is_none() {
+            return 0;
+        }
         match self.agent_panel_scope {
             AgentPanelScope::Current => self
                 .focused_session_data()
@@ -1385,6 +1530,7 @@ impl App {
     }
 
     fn focused_agent(&self) -> Option<(&SessionData, &AgentEvent)> {
+        self.focused_session_name()?;
         match self.agent_panel_scope {
             AgentPanelScope::Current => {
                 let session = self.focused_session_data()?;
@@ -1468,6 +1614,7 @@ mod tests {
     fn session(name: &str, dir: &str, is_worktree: bool) -> SessionData {
         SessionData {
             name: name.to_string(),
+            id: None,
             created_at: 0,
             dir: dir.to_string(),
             branch: String::new(),
@@ -1517,6 +1664,7 @@ mod tests {
         app.apply_server_message(ServerMessage::YourSession {
             name: "work".to_string(),
             client_tty: None,
+            session_id: None,
         });
         assert_eq!(app.focused_session_name(), Some("work"));
 
@@ -1577,6 +1725,7 @@ mod tests {
         app.apply_server_message(ServerMessage::YourSession {
             name: "renamed".to_string(),
             client_tty: None,
+            session_id: None,
         });
 
         assert_eq!(app.my_session.as_deref(), Some("renamed"));
@@ -1613,6 +1762,7 @@ mod tests {
         app.apply_server_message(ServerMessage::YourSession {
             name: "renamed".to_string(),
             client_tty: None,
+            session_id: None,
         });
 
         assert_eq!(app.focused_session_name(), Some("renamed"));
@@ -1678,6 +1828,212 @@ mod tests {
             command,
             ClientCommand::SwitchSession { name, .. } if name == "docs"
         )));
+    }
+
+    fn session_with_id(name: &str, id: &str, dir: &str, is_worktree: bool) -> SessionData {
+        let mut session = session(name, dir, is_worktree);
+        session.id = Some(id.to_string());
+        session
+    }
+
+    #[test]
+    fn renaming_the_own_session_keeps_identity_selection_and_activations() {
+        let mut state = empty_state(10);
+        state.sessions = vec![
+            session_with_id("work", "$1", "/tmp/work", false),
+            session_with_id("docs", "$2", "/tmp/docs", false),
+        ];
+        let mut app = App::from_state(state.clone());
+        app.apply_server_message(ServerMessage::YourSession {
+            name: "work".to_string(),
+            client_tty: None,
+            session_id: Some("$1".to_string()),
+        });
+        assert_eq!(app.focused_session_name(), Some("work"));
+
+        // The next State already carries the new name; nothing else is sent.
+        state.sessions[0].name = "work-renamed".to_string();
+        app.apply_server_message(ServerMessage::State(state));
+
+        assert_eq!(app.my_session.as_deref(), Some("work-renamed"));
+        assert_eq!(app.current_session.as_deref(), Some("work-renamed"));
+        assert_eq!(app.focused_session_name(), Some("work-renamed"));
+        app.apply_server_message(ServerMessage::ActivateSession {
+            name: "work-renamed".to_string(),
+            source_pane_id: Some("%99".to_string()),
+            chosen: true,
+        });
+        assert_eq!(app.focused_session_name(), Some("work-renamed"));
+        app.handle_tab(false);
+        assert_eq!(
+            app.drain_commands(),
+            vec![ClientCommand::SwitchSession {
+                name: "docs".to_string(),
+                client_tty: None,
+            }],
+            "Tab anchors on the renamed own row, not on the first row"
+        );
+    }
+
+    #[test]
+    fn renaming_the_selected_row_follows_it() {
+        let mut state = empty_state(10);
+        state.sessions = vec![
+            session_with_id("work", "$1", "/tmp/work", false),
+            session_with_id("docs", "$2", "/tmp/docs", false),
+        ];
+        let mut app = App::from_state(state.clone());
+        app.set_pane_identity("%1".to_string(), "work".to_string(), Some("@1".to_string()));
+        app.set_sidebar_focus(SidebarFocus::Session("docs".to_string()));
+
+        state.sessions[1].name = "docs2".to_string();
+        app.apply_server_message(ServerMessage::State(state));
+
+        assert_eq!(app.focused_session_name(), Some("docs2"));
+    }
+
+    #[test]
+    fn collapsing_the_selected_rows_group_elsewhere_selects_the_group_header() {
+        let mut state = empty_state(10);
+        state.sessions = vec![
+            session("main", "/repo", false),
+            session("feature-a", "/repo/worktrees/feature-a", true),
+            session("feature-b", "/repo/worktrees/feature-b", true),
+        ];
+        let mut app = App::from_state(state.clone());
+        app.set_pane_identity("%1".to_string(), "main".to_string(), Some("@1".to_string()));
+        app.set_sidebar_focus(SidebarFocus::Session("feature-a".to_string()));
+
+        // Another client collapsed the group.
+        state.collapsed_worktree_groups = vec!["/repo/worktrees".to_string()];
+        app.apply_server_message(ServerMessage::State(state.clone()));
+        assert_eq!(app.focused_group_key(), Some("/repo/worktrees"));
+
+        // The group dissolves to one member: the selection lands on it.
+        state.collapsed_worktree_groups.clear();
+        app.apply_server_message(ServerMessage::State(state.clone()));
+        app.set_sidebar_focus(SidebarFocus::WorktreeGroup("/repo/worktrees".to_string()));
+        state.sessions.pop();
+        app.apply_server_message(ServerMessage::State(state));
+        assert_eq!(app.focused_session_name(), Some("feature-a"));
+    }
+
+    #[test]
+    fn a_pending_switch_ends_when_the_client_rests_in_a_third_session() {
+        let mut state = empty_state(10);
+        state.sessions = vec![
+            session("a", "/tmp/a", false),
+            session("b", "/tmp/b", false),
+            session("c", "/tmp/c", false),
+        ];
+        state.current_session = Some("a".to_string());
+        let mut app = App::from_state(state.clone());
+        app.set_pane_identity("%1".to_string(), "a".to_string(), Some("@1".to_string()));
+        app.set_sidebar_focus(SidebarFocus::Session("b".to_string()));
+        app.activate_focused_session();
+        app.drain_commands();
+
+        // Still at home: the switch is in flight, keep waiting for it.
+        app.apply_server_message(ServerMessage::State(state.clone()));
+        app.set_sidebar_focus(SidebarFocus::Session("c".to_string()));
+        state.sessions.remove(2);
+        app.apply_server_message(ServerMessage::State(state.clone()));
+        assert_eq!(
+            app.focused_session_name(),
+            Some("b"),
+            "pending b is still a valid rehome"
+        );
+
+        // The client settled in a third session: the request is over.
+        state.sessions.push(session("c", "/tmp/c", false));
+        state.current_session = Some("c".to_string());
+        app.apply_server_message(ServerMessage::State(state.clone()));
+        app.set_sidebar_focus(SidebarFocus::Session("c".to_string()));
+        state.sessions.remove(2);
+        app.apply_server_message(ServerMessage::State(state));
+        assert_eq!(app.focused_session_name(), Some("a"));
+    }
+
+    #[test]
+    fn an_unlisted_own_session_never_becomes_an_invisible_selection() {
+        let mut state = empty_state(10);
+        let mut docs = session("docs", "/tmp/docs", false);
+        docs.agents
+            .push(agent_without_pane("amp", AgentStatus::Running));
+        let mut notes = session("notes", "/tmp/notes", false);
+        notes
+            .agents
+            .push(agent_without_pane("amp", AgentStatus::Running));
+        state.sessions = vec![session("work", "/tmp/work", false), docs, notes];
+        state.session_filter = Some(SessionFilterMode::Active);
+        let mut app = App::from_state(state);
+
+        app.apply_server_message(ServerMessage::YourSession {
+            name: "work".to_string(),
+            client_tty: None,
+            session_id: None,
+        });
+
+        assert_eq!(app.focused_session_name(), Some("docs"));
+        app.handle_tab(false);
+        assert_eq!(
+            app.drain_commands(),
+            vec![ClientCommand::SwitchSession {
+                name: "docs".to_string(),
+                client_tty: None,
+            }]
+        );
+        app.move_focus(1);
+        assert_eq!(app.focused_session_name(), Some("notes"));
+    }
+
+    #[test]
+    fn tab_at_the_list_boundary_leaves_the_selection_alone() {
+        let mut state = empty_state(10);
+        state.sessions = vec![
+            session("work", "/tmp/work", false),
+            session("docs", "/tmp/docs", false),
+        ];
+        let mut app = App::from_state(state);
+        app.set_pane_identity("%1".to_string(), "work".to_string(), Some("@1".to_string()));
+        app.set_sidebar_focus(SidebarFocus::Session("docs".to_string()));
+
+        app.handle_tab(true);
+        assert!(app.drain_commands().is_empty());
+        assert_eq!(app.focused_session_name(), Some("docs"));
+
+        app.handle_tab(false);
+        assert_eq!(
+            app.drain_commands(),
+            vec![ClientCommand::SwitchSession {
+                name: "docs".to_string(),
+                client_tty: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_repeated_chosen_activation_of_the_selected_row_keeps_the_agents_panel() {
+        let mut state = empty_state(10);
+        let mut work = session("work", "/tmp/work", false);
+        work.agents
+            .push(agent_without_pane("amp", AgentStatus::Running));
+        work.agents
+            .push(agent_without_pane("codex", AgentStatus::Done));
+        state.sessions = vec![work];
+        let mut app = App::from_state(state);
+        app.set_pane_identity("%1".to_string(), "work".to_string(), Some("@1".to_string()));
+        app.focus_agents_panel();
+        app.focused_agent_idx = 1;
+
+        app.apply_server_message(ServerMessage::ActivateSession {
+            name: "work".to_string(),
+            source_pane_id: Some("%99".to_string()),
+            chosen: true,
+        });
+
+        assert_eq!(app.panel_focus, PanelFocus::Agents);
+        assert_eq!(app.focused_agent_idx, 1);
     }
 
     #[test]

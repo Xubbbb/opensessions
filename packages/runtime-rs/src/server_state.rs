@@ -109,6 +109,7 @@ pub fn build_read_only_state(input: ReadOnlyStateInput<'_>) -> ServerState {
                 build_local_links(ports.iter().copied(), input.portless_state.as_ref());
 
             SessionData {
+                id: (!session.id.is_empty()).then(|| session.id.clone()),
                 name: session.name,
                 created_at: session.created_at,
                 dir: session.dir,

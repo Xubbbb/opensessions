@@ -29,8 +29,9 @@ Clicking a detected port opens `http://localhost:<port>`.
 
 - Multiple agent instances per session when a watcher emits `threadId`
 - Per-instance unseen tracking: a finished agent keeps its `●` until its pane is the active pane of an attached tmux client, until you `Enter` it, or until the session is marked seen
-- The selected row is yours: it moves when you move it, when you pick a session (Enter, click, `1`–`9`, the index keys, or opening an agent: the sidebar you arrive in then shows that session selected), or when its row disappears. A plain tmux switch back to a session leaves its sidebar's selection where you put it. The current session is marked with `▌`, the selected row with `›`.
-- Renaming a tmux session keeps its sidebar working: the sidebar re-identifies itself and follows the new name (its `▌` marker and agents panel stay). Other sidebars that had the old name selected fall back to their own row, since rows are identified by name.
+- The selected row is yours: it moves when you move it, when you pick a session (Enter, click, `1`–`9`, the index keys, opening an agent, or killing the current session — the sidebar you arrive in then shows that session selected), or when its row disappears. A plain tmux switch back to a session, or a window a script opened elsewhere, leaves your selection where you put it. The current session is marked with `▌`, the selected row with `›`.
+- Leaving a session through its sidebar hands that window's keyboard focus back to the pane you came from, so returning there later does not feed your typing to the sidebar. A double-click's second press is ignored in the sidebar you land in, and the mouse is inert while a confirmation is open.
+- Sessions are identified by their tmux session id, so renaming one (`prefix + $`, `rename-session`) keeps its row, its place in the order, its hidden state, its `▌` marker and its selection in every sidebar.
 - Status values: `idle`, `running`, `tool-running`, `done`, `error`, `waiting`, `interrupted`, `stale`; a qualifier in parentheses adds the reason when there is one (`working (delegating)` while background subagents run, `blocked (dialog open)`, `done (shell running)`)
 - Live Claude Code sessions are rows even while idle (`✓ idle`), named after their `/rename` name
 - Agents are removed automatically about 10 seconds after their tmux pane or process disappears, whatever their status. Agents that never had a pane are dropped after 5 minutes once seen or 30 minutes while still unseen when finished, and after 30 minutes of silence otherwise. `d` in the agents panel removes one immediately.
@@ -48,7 +49,7 @@ Clicking a detected port opens `http://localhost:<port>`.
 
 ### tmux-specific
 
-- Global hooks for session changes, pane/window selection, window creation, pane exit, and resize. Each hook is installed in array slot `90210` (for example `after-select-window[90210]`) so other plugins' hooks on the same events are left intact
+- Global hooks for session changes and renames, pane/window selection, window creation, pane exit, and resize. Each hook is installed in array slot `90210` (for example `after-select-window[90210]`) so other plugins' hooks on the same events are left intact
 - Sidebar panes are launched through `sh -c`, so any tmux `default-shell` works, including fish
 - `prefix o → e` parks the sidebar pane in a session named `_os_stash` while re-laying out the window, then joins it back at its fixed width
 

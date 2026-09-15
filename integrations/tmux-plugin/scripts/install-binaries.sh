@@ -37,7 +37,7 @@ download() {
   # Bounded: this runs synchronously while tmux loads its config, so a
   # stalled connection must not hang the tmux startup.
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --connect-timeout 10 -m 180 "$url" -o "$dest"
+    curl -fsSL --connect-timeout 10 -m 180 --retry 2 --retry-delay 1 "$url" -o "$dest"
   elif command -v wget >/dev/null 2>&1; then
     wget -q --timeout=10 --tries=2 -O "$dest" "$url"
   else

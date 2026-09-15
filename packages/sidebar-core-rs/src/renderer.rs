@@ -637,8 +637,7 @@ fn build_group_row(
     width: usize,
 ) -> StyledLine {
     let hit = HitTarget::Group(key.to_string());
-    let focused =
-        app.panel_focus == crate::app::PanelFocus::Sessions && app.focused_group_key() == Some(key);
+    let focused = app.focused_group_key() == Some(key);
     let active_surrogate = collapsed
         && app
             .current_session
@@ -2839,6 +2838,7 @@ mod tests {
     fn session(name: &str, dir: &str, branch: &str) -> SessionData {
         SessionData {
             name: name.to_string(),
+            id: None,
             created_at: 0,
             dir: dir.to_string(),
             branch: branch.to_string(),
@@ -2906,6 +2906,7 @@ mod tests {
         App::from_state(ServerState {
             sessions: vec![SessionData {
                 name: "opensessions".to_string(),
+                id: None,
                 created_at: 0,
                 dir: "/tmp/opensessions".to_string(),
                 branch: "main".to_string(),

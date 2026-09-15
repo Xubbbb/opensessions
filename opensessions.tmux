@@ -30,7 +30,10 @@ SCRIPT_DIR="$SCRIPTS_DIR"
 PACKAGE_VERSION="$(grep -o '"version": *"[^"]*"' "$CURRENT_DIR/package.json" 2>/dev/null | head -1 | cut -d'"' -f4)"
 BIN_VERSION="$(cat "$CURRENT_DIR/bin/.opensessions-version" 2>/dev/null || true)"
 if [ ! -x "$CURRENT_DIR/bin/opensessions-sidebar" ] || [ ! -x "$CURRENT_DIR/bin/opensessions-server" ] || [ ! -x "$CURRENT_DIR/bin/lazydiff" ] || [ "$BIN_VERSION" != "$PACKAGE_VERSION" ]; then
-  sh "$SCRIPTS_DIR/install-binaries.sh" "$CURRENT_DIR" >/tmp/opensessions-install.log 2>&1 || true
+  if ! sh "$SCRIPTS_DIR/install-binaries.sh" "$CURRENT_DIR" >/tmp/opensessions-install.log 2>&1; then
+    # Keep running what is installed; say so instead of failing silently.
+    tmux display-message "opensessions: download of v${PACKAGE_VERSION} failed, keeping v${BIN_VERSION:-none} (see /tmp/opensessions-install.log)" 2>/dev/null || true
+  fi
 fi
 
 . "$SCRIPTS_DIR/server-common.sh"

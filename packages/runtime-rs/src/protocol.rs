@@ -19,9 +19,14 @@ pub enum ServerMessage {
     Hello(ProtocolHello),
     State(ServerState),
     Quit,
+    /// The session this client's pane is in, answered to `identify-pane`
+    /// (and re-sent after `ReIdentify`). `session_id` is the mux's stable
+    /// id (tmux `$N`), which survives renames.
     YourSession {
         name: String,
         client_tty: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
     },
     /// The client is (about to be) in `name`. `chosen` is true when the user
     /// picked that session in a sidebar or with an index key, false when tmux
@@ -64,6 +69,9 @@ pub struct ServerState {
 #[serde(rename_all = "camelCase")]
 pub struct SessionData {
     pub name: String,
+    /// Mux-native stable id (tmux `$N`); lets clients follow a rename.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub created_at: u64,
     pub dir: String,
     pub branch: String,
